@@ -1,0 +1,31 @@
+{
+  "name": "whatsapp-saas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Plataforma SaaS de atendimento WhatsApp + IA para varejo",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm run dev --workspace=@app/api",
+    "dev:web": "npm run dev --workspace=@app/web",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "docker:up": "docker compose -f docker/docker-compose.yml up -d",
+    "docker:down": "docker compose -f docker/docker-compose.yml down",
+    "docker:logs": "docker compose -f docker/docker-compose.yml logs -f",
+    "db:migrate": "npm run db:migrate --workspace=@app/api",
+    "db:studio": "npm run db:studio --workspace=@app/api"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "prettier": "^3.2.5",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

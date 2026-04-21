@@ -1,0 +1,415 @@
+// Schema Prisma — WhatsApp SaaS
+// Multi-tenant: todas as tabelas de negócio possuem tenantId
+// Enums usam strings legíveis para facilitar debug e leitura direta no banco
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================================
+// TENANTS E USUÁRIOS (multi-tenancy)
+// =========================================================================
+
+model Tenant {
+  id            String   @id @default(uuid())
+  name          String
+  slug          String   @unique
+  segment       String?
+  status        TenantStatus @default(ACTIVE)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  users         User[]
+  whatsappInstances WhatsappInstance[]
+  contacts      Contact[]
+  conversations Conversation[]
+  messages      Message[]
+  products      Product[]
+  categories    Category[]
+  orders        Order[]
+  settings      TenantSettings?
+  faqs          Faq[]
+  automationRules AutomationRule[]
+
+  @@map("tenants")
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+}
+
+model User {
+  id        String   @id @default(uuid())
+  tenantId  String
+  email     String
+  password  String
+  name      String
+  role      UserRole @default(OWNER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignedConversations Conversation[] @relation("AssignedUser")
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("users")
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  AGENT
+}
+
+model TenantSettings {
+  id              String   @id @default(uuid())
+  tenantId        String   @unique
+  welcomeMessage  String?
+  awayMessage     String?
+  businessHours   Json?
+  aiEnabled       Boolean  @default(true)
+  aiInstructions  String?
+  handoffKeywords String[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("tenant_settings")
+}
+
+// =========================================================================
+// WHATSAPP (instâncias e webhooks)
+// =========================================================================
+
+model WhatsappInstance {
+  id            String   @id @default(uuid())
+  tenantId     String
+  instanceName String   @unique
+  phoneNumber  String?
+  status       InstanceStatus @default(DISCONNECTED)
+  apiKey       String
+  qrCode       String?
+  lastConnectedAt DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("whatsapp_instances")
+}
+
+enum InstanceStatus {
+  DISCONNECTED
+  CONNECTING
+  CONNECTED
+  QRCODE
+  ERROR
+}
+
+// =========================================================================
+// CONTATOS (clientes finais da loja)
+// =========================================================================
+
+model Contact {
+  id         String   @id @default(uuid())
+  tenantId   String
+  phone      String
+  name       String?
+  pushName   String?
+  avatarUrl  String?
+  blocked    Boolean  @default(false)
+  tags       String[]
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  messages   Message[]
+  orders     Order[]
+
+  @@unique([tenantId, phone])
+  @@index([tenantId])
+  @@map("contacts")
+}
+
+// =========================================================================
+// CONVERSAS E MENSAGENS
+// =========================================================================
+
+model Conversation {
+  id            String   @id @default(uuid())
+  tenantId      String
+  contactId     String
+  status        ConversationStatus @default(BOT)
+  assignedUserId String?
+  lastMessageAt DateTime?
+  unreadCount   Int      @default(0)
+  summary       String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact       Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  assignedUser  User?    @relation("AssignedUser", fields: [assignedUserId], references: [id])
+  messages      Message[]
+  orders        Order[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, lastMessageAt])
+  @@map("conversations")
+}
+
+enum ConversationStatus {
+  BOT
+  HUMAN
+  RESOLVED
+  ARCHIVED
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  tenantId       String
+  conversationId String
+  contactId      String
+  externalId     String?
+  direction      MessageDirection
+  type           MessageType
+  content        String?
+  mediaUrl       String?
+  mediaMimeType  String?
+  status         MessageStatus @default(PENDING)
+  fromBot        Boolean  @default(false)
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  contact        Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([externalId])
+  @@index([tenantId, conversationId])
+  @@index([tenantId, createdAt])
+  @@map("messages")
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  AUDIO
+  VIDEO
+  DOCUMENT
+  LOCATION
+  CONTACT
+  STICKER
+  SYSTEM
+}
+
+enum MessageStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+// =========================================================================
+// CATÁLOGO (produtos e categorias)
+// =========================================================================
+
+model Category {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  slug      String
+  order     Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  products  Product[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@map("categories")
+}
+
+model Product {
+  id            String   @id @default(uuid())
+  tenantId      String
+  categoryId    String?
+  sku           String?
+  name          String
+  description   String?
+  specifications Json?
+  price         Decimal  @db.Decimal(12, 2)
+  priceCash     Decimal? @db.Decimal(12, 2)
+  priceInstallment Decimal? @db.Decimal(12, 2)
+  installments  Int?
+  stock         Int      @default(0)
+  trackStock    Boolean  @default(true)
+  condition     ProductCondition @default(NEW)
+  warranty      String?
+  images        String[]
+  active        Boolean  @default(true)
+  paused        Boolean  @default(false)
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category      Category? @relation(fields: [categoryId], references: [id])
+  variations    ProductVariation[]
+  orderItems    OrderItem[]
+
+  @@index([tenantId, active, paused])
+  @@index([tenantId, categoryId])
+  @@map("products")
+}
+
+enum ProductCondition {
+  NEW
+  SEMINEW
+  USED
+  SHOWCASE
+  REFURBISHED
+}
+
+model ProductVariation {
+  id        String   @id @default(uuid())
+  productId String
+  name      String
+  sku       String?
+  price     Decimal? @db.Decimal(12, 2)
+  stock     Int      @default(0)
+  attributes Json
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_variations")
+}
+
+// =========================================================================
+// PEDIDOS
+// =========================================================================
+
+model Order {
+  id             String   @id @default(uuid())
+  tenantId       String
+  contactId      String
+  conversationId String?
+  orderNumber    String
+  status         OrderStatus @default(PENDING)
+  paymentMethod  String?
+  paymentStatus  PaymentStatus @default(PENDING)
+  deliveryMethod String?
+  deliveryAddress Json?
+  subtotal       Decimal  @db.Decimal(12, 2)
+  discount       Decimal  @default(0) @db.Decimal(12, 2)
+  total          Decimal  @db.Decimal(12, 2)
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact        Contact  @relation(fields: [contactId], references: [id])
+  conversation   Conversation? @relation(fields: [conversationId], references: [id])
+  items          OrderItem[]
+
+  @@unique([tenantId, orderNumber])
+  @@index([tenantId, status])
+  @@map("orders")
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  REFUNDED
+  FAILED
+}
+
+model OrderItem {
+  id          String   @id @default(uuid())
+  orderId     String
+  productId   String
+  variationId String?
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(12, 2)
+  total       Decimal  @db.Decimal(12, 2)
+  snapshot    Json
+
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product  @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+// =========================================================================
+// AUTOMAÇÕES (FAQ e regras)
+// =========================================================================
+
+model Faq {
+  id        String   @id @default(uuid())
+  tenantId  String
+  question  String
+  answer    String
+  keywords  String[]
+  active    Boolean  @default(true)
+  priority  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, active])
+  @@map("faqs")
+}
+
+model AutomationRule {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  trigger   String
+  condition Json
+  action    Json
+  active    Boolean  @default(true)
+  priority  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, active])
+  @@map("automation_rules")
+}
