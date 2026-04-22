@@ -1,63 +1,77 @@
 'use client';
 
 import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
 import Link from 'next/link';
+import { Store, User, Mail } from 'lucide-react';
 import { useRegister } from '@/lib/hooks/useAuth';
-
-interface RegisterForm {
-  name: string;
-  tenantName: string;
-  email: string;
-  password: string;
-}
+import { registerSchema, type RegisterInput } from '@/lib/validation/schemas';
+import { ValidatedInput } from '@/components/ui/ValidatedInput';
+import { PasswordStrengthMeter } from '@/components/ui/PasswordStrengthMeter';
 
 export default function RegisterPage() {
-  const { register, handleSubmit, formState: { errors } } = useForm<RegisterForm>();
-  const mutation = useRegister();
+  const {
+    register,
+    handleSubmit,
+    watch,
+    formState: { errors, touchedFields, dirtyFields },
+  } = useForm<RegisterInput>({
+    resolver: zodResolver(registerSchema),
+    mode: 'onBlur',
+  });
 
-  const onSubmit = (data: RegisterForm) => mutation.mutate(data);
+  const mutation = useRegister();
+  const password = watch('password') ?? '';
+
+  const onSubmit = (data: RegisterInput) => mutation.mutate(data);
+
+  const isFieldValid = (name: keyof RegisterInput) =>
+    !errors[name] && (touchedFields[name] || dirtyFields[name]);
 
   return (
     <div>
       <h2 className="mb-6 text-xl font-semibold text-gray-900">Criar conta</h2>
-      <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+      <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
+        <ValidatedInput
+          label="Nome da loja"
+          placeholder="Minha Loja de Eletrônicos"
+          error={errors.tenantName?.message}
+          isValid={isFieldValid('tenantName')}
+          showValidIcon
+          rightElement={<Store className="h-4 w-4 text-gray-400" />}
+          {...register('tenantName')}
+        />
+        <ValidatedInput
+          label="Seu nome"
+          autoComplete="name"
+          placeholder="João Silva"
+          error={errors.name?.message}
+          isValid={isFieldValid('name')}
+          showValidIcon
+          rightElement={<User className="h-4 w-4 text-gray-400" />}
+          {...register('name')}
+        />
+        <ValidatedInput
+          label="E-mail"
+          type="email"
+          autoComplete="email"
+          placeholder="voce@loja.com"
+          error={errors.email?.message}
+          isValid={isFieldValid('email')}
+          showValidIcon
+          rightElement={<Mail className="h-4 w-4 text-gray-400" />}
+          {...register('email')}
+        />
         <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">Nome da loja</label>
-          <input
-            className="input"
-            placeholder="Minha Loja de Eletrônicos"
-            {...register('tenantName', { required: 'Nome da loja obrigatório' })}
-          />
-          {errors.tenantName && <p className="mt-1 text-xs text-red-600">{errors.tenantName.message}</p>}
-        </div>
-        <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">Seu nome</label>
-          <input
-            className="input"
-            placeholder="João Silva"
-            {...register('name', { required: 'Nome obrigatório' })}
-          />
-          {errors.name && <p className="mt-1 text-xs text-red-600">{errors.name.message}</p>}
-        </div>
-        <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">E-mail</label>
-          <input
-            type="email"
-            className="input"
-            placeholder="voce@loja.com"
-            {...register('email', { required: 'E-mail obrigatório' })}
-          />
-          {errors.email && <p className="mt-1 text-xs text-red-600">{errors.email.message}</p>}
-        </div>
-        <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">Senha</label>
-          <input
+          <ValidatedInput
+            label="Senha"
             type="password"
-            className="input"
+            autoComplete="new-password"
             placeholder="Mínimo 8 caracteres"
-            {...register('password', { required: 'Senha obrigatória', minLength: { value: 8, message: 'Mínimo 8 caracteres' } })}
+            error={errors.password?.message}
+            {...register('password')}
           />
-          {errors.password && <p className="mt-1 text-xs text-red-600">{errors.password.message}</p>}
+          <PasswordStrengthMeter password={password} />
         </div>
         <button type="submit" className="btn-primary w-full" disabled={mutation.isPending}>
           {mutation.isPending ? 'Criando...' : 'Criar conta'}

@@ -6,10 +6,16 @@ import {
   UpdateProductDto,
   ListProductsQueryDto,
 } from './dto/product.dto';
+import { CustomFieldsService } from '../custom-fields/custom-fields.module';
+
+const PRODUCT_ENTITY = 'product';
 
 @Injectable()
 export class ProductsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly customFields: CustomFieldsService,
+  ) {}
 
   async list(tenantId: string, query: ListProductsQueryDto) {
     const page = query.page ?? 1;
@@ -64,6 +70,12 @@ export class ProductsService {
   }
 
   async create(tenantId: string, dto: CreateProductDto) {
+    const customFields = await this.customFields.validateAndSanitize(
+      tenantId,
+      PRODUCT_ENTITY,
+      dto.customFields,
+    );
+
     return this.prisma.product.create({
       data: {
         tenantId,
@@ -80,24 +92,52 @@ export class ProductsService {
         condition: dto.condition ?? 'NEW',
         warranty: dto.warranty,
         images: dto.images ?? [],
-        specifications: dto.specifications ?? Prisma.JsonNull,
+        specifications:
+          (dto.specifications as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+        customFields: customFields ?? Prisma.JsonNull,
       },
     });
   }
 
   async update(tenantId: string, id: string, dto: UpdateProductDto) {
-    // Confirma que pertence ao tenant
     await this.findOne(tenantId, id);
 
-    return this.prisma.product.update({
-      where: { id },
-      data: {
-        ...dto,
-        ...(dto.specifications !== undefined && {
-          specifications: dto.specifications ?? Prisma.JsonNull,
-        }),
-      },
-    });
+    const data: Prisma.ProductUpdateInput = {
+      ...(dto.name !== undefined && { name: dto.name }),
+      ...(dto.description !== undefined && { description: dto.description }),
+      ...(dto.categoryId !== undefined && {
+        category: dto.categoryId
+          ? { connect: { id: dto.categoryId } }
+          : { disconnect: true },
+      }),
+      ...(dto.sku !== undefined && { sku: dto.sku }),
+      ...(dto.price !== undefined && { price: dto.price }),
+      ...(dto.priceCash !== undefined && { priceCash: dto.priceCash }),
+      ...(dto.priceInstallment !== undefined && { priceInstallment: dto.priceInstallment }),
+      ...(dto.installments !== undefined && { installments: dto.installments }),
+      ...(dto.stock !== undefined && { stock: dto.stock }),
+      ...(dto.trackStock !== undefined && { trackStock: dto.trackStock }),
+      ...(dto.condition !== undefined && { condition: dto.condition }),
+      ...(dto.warranty !== undefined && { warranty: dto.warranty }),
+      ...(dto.images !== undefined && { images: dto.images }),
+      ...(dto.active !== undefined && { active: dto.active }),
+      ...(dto.paused !== undefined && { paused: dto.paused }),
+      ...(dto.specifications !== undefined && {
+        specifications:
+          (dto.specifications as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      }),
+    };
+
+    if (dto.customFields !== undefined) {
+      const customFields = await this.customFields.validateAndSanitize(
+        tenantId,
+        PRODUCT_ENTITY,
+        dto.customFields,
+      );
+      data.customFields = customFields ?? Prisma.JsonNull;
+    }
+
+    return this.prisma.product.update({ where: { id }, data });
   }
 
   async remove(tenantId: string, id: string) {
@@ -106,9 +146,6 @@ export class ProductsService {
     return { ok: true };
   }
 
-  /**
-   * Toggle rápido pausar/despausar — usado no mobile pra ação de 2 toques
-   */
   async togglePause(tenantId: string, id: string) {
     const product = await this.findOne(tenantId, id);
     return this.prisma.product.update({
@@ -117,16 +154,12 @@ export class ProductsService {
     });
   }
 
-  /**
-   * Ajusta estoque (+/-). Usado após venda ou reposição.
-   */
   async adjustStock(tenantId: string, id: string, delta: number) {
     await this.findOne(tenantId, id);
     return this.prisma.product.update({
       where: { id },
       data: {
         stock: { increment: delta },
-        // Auto-pausa se zerou
         ...(delta < 0 && { paused: { set: false } }),
       },
     });

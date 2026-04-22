@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString, IsBoolean, IsArray } from 'class-validator';
-import { Prisma } from '@prisma/client';
+import { Prisma, Contact } from '@prisma/client';
 
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -41,15 +41,20 @@ export class ContactsService {
       }),
     };
 
-    return this.prisma.$transaction([
-      this.prisma.contact.findMany({
-        where,
-        orderBy: { updatedAt: 'desc' },
-        skip: (page - 1) * pageSize,
-        take: pageSize,
-      }),
-      this.prisma.contact.count({ where }),
-    ]).then(([items, total]) => ({ items, pagination: { page, pageSize, total } }));
+    return this.prisma
+      .$transaction([
+        this.prisma.contact.findMany({
+          where,
+          orderBy: { updatedAt: 'desc' },
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+        }),
+        this.prisma.contact.count({ where }),
+      ])
+      .then(([items, total]: [Contact[], number]) => ({
+        items,
+        pagination: { page, pageSize, total },
+      }));
   }
 
   async findOne(tenantId: string, id: string) {

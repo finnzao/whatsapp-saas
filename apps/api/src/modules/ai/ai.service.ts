@@ -1,9 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import Anthropic from '@anthropic-ai/sdk';
+import { Message as PrismaMessage } from '@prisma/client';
 
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { CatalogTools } from './catalog.tools';
+import { LlmProviderFactory } from './providers/llm-provider.factory';
+import {
+  LlmProvider,
+  LlmMessage,
+  LlmContentBlock,
+} from './providers/llm-provider.interface';
 
 interface GenerateReplyParams {
   tenantId: string;
@@ -18,85 +23,78 @@ interface AiReplyResult {
   handoffReason?: string;
 }
 
-/**
- * Camada de IA. Usa Claude com function calling pra consultar o catálogo.
- * Fácil de trocar por OpenAI mudando o client (schema das tools é compatível).
- */
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
-  private readonly client: Anthropic;
-  private readonly model: string;
+  private readonly provider: LlmProvider;
 
   constructor(
-    private readonly config: ConfigService,
     private readonly prisma: PrismaService,
     private readonly tools: CatalogTools,
+    private readonly factory: LlmProviderFactory,
   ) {
-    this.client = new Anthropic({
-      apiKey: this.config.get<string>('ANTHROPIC_API_KEY', ''),
-    });
-    this.model = this.config.get<string>('AI_MODEL', 'claude-haiku-4-5-20251001');
+    this.provider = this.factory.getMainProvider();
   }
 
   async generateReply(params: GenerateReplyParams): Promise<AiReplyResult> {
     const history = await this.buildMessageHistory(params.conversationId);
     const systemPrompt = this.buildSystemPrompt(params.instructions);
 
-    const messages: Anthropic.MessageParam[] = [
+    const messages: LlmMessage[] = [
       ...history,
       { role: 'user', content: params.userMessage },
     ];
 
-    // Loop de tool use — modelo pode chamar ferramentas várias vezes
+    const toolDefinitions = this.tools.getToolDefinitions().map((t: any) => ({
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema,
+    }));
+
     const MAX_ITERATIONS = 5;
     for (let i = 0; i < MAX_ITERATIONS; i++) {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 1024,
+      const response = await this.provider.complete({
         system: systemPrompt,
-        tools: this.tools.getToolDefinitions() as any,
         messages,
+        tools: this.provider.supportsToolCalling() ? toolDefinitions : undefined,
+        maxTokens: 1024,
       });
 
-      // Se modelo terminou sem chamar tool, retorna resposta
-      if (response.stop_reason === 'end_turn' || response.stop_reason === 'stop_sequence') {
-        const text = response.content
-          .filter((b) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('\n')
-          .trim();
-
-        return { text };
+      if (response.stopReason !== 'tool_use' || response.toolCalls.length === 0) {
+        return { text: response.text };
       }
 
-      // Se chamou tool, executa e volta pro loop
-      if (response.stop_reason === 'tool_use') {
-        const toolUses = response.content.filter((b) => b.type === 'tool_use') as any[];
-        const toolResults: any[] = [];
+      const toolResultBlocks: LlmContentBlock[] = [];
 
-        for (const toolUse of toolUses) {
-          const result = await this.tools.execute(params.tenantId, toolUse.name, toolUse.input);
+      for (const toolCall of response.toolCalls) {
+        const result = await this.tools.execute(params.tenantId, toolCall.name, toolCall.input);
 
-          // Handoff: interrompe e sinaliza
-          if (result?.handoff) {
-            return { handoff: true, handoffReason: result.reason };
-          }
-
-          toolResults.push({
-            type: 'tool_result',
-            tool_use_id: toolUse.id,
-            content: JSON.stringify(result),
-          });
+        if (result && typeof result === 'object' && 'handoff' in result && (result as any).handoff) {
+          return { handoff: true, handoffReason: (result as any).reason };
         }
 
-        // Adiciona resposta do modelo e resultados das tools ao histórico
-        messages.push({ role: 'assistant', content: response.content });
-        messages.push({ role: 'user', content: toolResults });
-        continue;
+        toolResultBlocks.push({
+          type: 'tool_result',
+          tool_use_id: toolCall.id,
+          content: JSON.stringify(result),
+        });
       }
 
-      break;
+      const assistantBlocks: LlmContentBlock[] = [];
+      if (response.text) {
+        assistantBlocks.push({ type: 'text', text: response.text });
+      }
+      for (const tc of response.toolCalls) {
+        assistantBlocks.push({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.name,
+          input: tc.input,
+        });
+      }
+
+      messages.push({ role: 'assistant', content: assistantBlocks });
+      messages.push({ role: 'user', content: toolResultBlocks });
     }
 
     this.logger.warn('IA excedeu max iterations sem concluir');
@@ -119,7 +117,7 @@ Regras importantes:
 ${customInstructions ? `\nInstruções específicas da loja:\n${customInstructions}` : ''}`;
   }
 
-  private async buildMessageHistory(conversationId: string): Promise<Anthropic.MessageParam[]> {
+  private async buildMessageHistory(conversationId: string): Promise<LlmMessage[]> {
     const messages = await this.prisma.message.findMany({
       where: {
         conversationId,
@@ -132,9 +130,9 @@ ${customInstructions ? `\nInstruções específicas da loja:\n${customInstructio
 
     return messages
       .reverse()
-      .slice(0, -1) // remove a última (que é a mensagem atual do user)
-      .map((m) => ({
-        role: m.direction === 'INBOUND' ? 'user' : 'assistant',
+      .slice(0, -1)
+      .map((m: PrismaMessage) => ({
+        role: m.direction === 'INBOUND' ? ('user' as const) : ('assistant' as const),
         content: m.content!,
       }));
   }

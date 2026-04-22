@@ -9,6 +9,7 @@ import {
   Settings,
   LogOut,
   Smartphone,
+  Bug,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLogout } from '@/lib/hooks/useAuth';
@@ -20,9 +21,14 @@ const menuItems = [
   { href: '/configuracoes', label: 'Configurações', icon: Settings },
 ];
 
+const devMenuItems = [{ href: '/debug', label: 'Debug', icon: Bug }];
+
 export function Sidebar() {
   const pathname = usePathname();
   const logout = useLogout();
+  const isDev = process.env.NODE_ENV !== 'production';
+
+  const items = isDev ? [...menuItems, ...devMenuItems] : menuItems;
 
   return (
     <aside className="flex h-screen w-64 flex-col border-r border-gray-200 bg-white">
@@ -32,9 +38,10 @@ export function Sidebar() {
       </div>
 
       <nav className="flex-1 space-y-1 p-4">
-        {menuItems.map((item) => {
+        {items.map((item) => {
           const active = pathname.startsWith(item.href);
           const Icon = item.icon;
+          const isDevItem = devMenuItems.some((d) => d.href === item.href);
           return (
             <Link
               key={item.href}
@@ -44,10 +51,16 @@ export function Sidebar() {
                 active
                   ? 'bg-brand-50 text-brand-700'
                   : 'text-gray-700 hover:bg-gray-50 hover:text-gray-900',
+                isDevItem && !active && 'text-amber-700',
               )}
             >
               <Icon className="h-4 w-4" />
               {item.label}
+              {isDevItem && (
+                <span className="ml-auto rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+                  DEV
+                </span>
+              )}
             </Link>
           );
         })}

@@ -13,7 +13,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="pt-BR">
       <body>
         <Providers>{children}</Providers>
-        <Toaster position="top-right" richColors />
+        <Toaster
+          position="bottom-left"
+          richColors
+          closeButton
+          duration={2500}
+          toastOptions={{
+            style: { fontSize: '13px' },
+          }}
+        />
       </body>
     </html>
   );

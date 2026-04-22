@@ -9,7 +9,7 @@ import {
   HttpCode,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { ConversationStatus } from '@prisma/client';
+import { $Enums } from '@prisma/client';
 
 import { ConversationsService } from './conversations.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -29,7 +29,7 @@ export class ConversationsController {
   @Get()
   list(
     @CurrentTenant() tenantId: string,
-    @Query('status') status?: ConversationStatus,
+    @Query('status') status?: $Enums.ConversationStatus,
     @Query('page') page?: number,
     @Query('pageSize') pageSize?: number,
   ) {

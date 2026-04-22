@@ -1,41 +1,59 @@
-import axios, { AxiosError } from 'axios';
+'use client';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+import axios, { AxiosError } from 'axios';
+import { getAuthToken, useAuthStore } from '@/lib/stores/auth.store';
+
+const DEBUG = typeof window !== 'undefined' && process.env.NODE_ENV !== 'production';
 
 export const api = axios.create({
-  baseURL: API_URL,
-  headers: { 'Content-Type': 'application/json' },
+  baseURL: process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001',
+  timeout: 60_000,
 });
 
-// Interceptor - anexa o token JWT do localStorage
 api.interceptors.request.use((config) => {
-  if (typeof window !== 'undefined') {
-    const token = localStorage.getItem('accessToken');
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
+  const token = getAuthToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
   }
   return config;
 });
 
-// Interceptor - redireciona pro login em caso de 401
 api.interceptors.response.use(
   (r) => r,
   (error: AxiosError) => {
-    if (error.response?.status === 401 && typeof window !== 'undefined') {
-      localStorage.removeItem('accessToken');
-      if (!window.location.pathname.startsWith('/login')) {
-        window.location.href = '/login';
+    if (error.response?.status === 401) {
+      const state = useAuthStore.getState();
+      const path = typeof window !== 'undefined' ? window.location.pathname : '';
+      const isAuthRoute = path === '/login' || path === '/register';
+
+      if (DEBUG) {
+        console.warn('[api] 401', {
+          url: error.config?.url,
+          path,
+          hadToken: Boolean(state.token),
+          hydrated: state._hydrated,
+        });
+      }
+
+      if (state._hydrated && state.token && !isAuthRoute) {
+        state.clearAuth();
+        if (typeof window !== 'undefined') {
+          window.location.assign('/login');
+        }
       }
     }
     return Promise.reject(error);
   },
 );
 
-export function extractApiError(error: unknown): string {
-  if (error instanceof AxiosError) {
-    const data = error.response?.data as any;
-    return data?.message ?? data?.error ?? error.message;
+export function extractApiError(err: unknown): string {
+  if (axios.isAxiosError(err)) {
+    const data = err.response?.data as any;
+    if (data?.message) {
+      return Array.isArray(data.message) ? data.message.join(', ') : data.message;
+    }
+    if (err.message) return err.message;
   }
+  if (err instanceof Error) return err.message;
   return 'Erro desconhecido';
 }

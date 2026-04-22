@@ -6,6 +6,7 @@ import { WhatsappController } from './whatsapp.controller';
 import { EvolutionProvider } from './evolution/evolution.provider';
 import { EvolutionWebhookController } from './webhooks/evolution.controller';
 import { InboundMessageProcessor } from './webhooks/inbound-message.processor';
+import { WhatsappEventsListener } from './listeners/whatsapp-events.listener';
 import { WHATSAPP_PROVIDER } from './whatsapp-provider.interface';
 import { QUEUE_NAMES } from '../../queue/queue.constants';
 import { AutomationsModule } from '../automations/automations.module';
@@ -24,6 +25,7 @@ import { AiModule } from '../ai/ai.module';
   providers: [
     WhatsappService,
     InboundMessageProcessor,
+    WhatsappEventsListener,
     {
       provide: WHATSAPP_PROVIDER,
       useClass: EvolutionProvider,

@@ -1,7 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { Faq } from '@prisma/client';
+
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AiService } from '../ai/ai.service';
-import { WhatsappService } from '../whatsapp/whatsapp.service';
+import { IntentClassifier, FaqCandidate } from '../ai/intent-classifier.service';
+import {
+  APP_EVENTS,
+  OutboundMessageRequestedEvent,
+  ConversationHandoffRequestedEvent,
+} from '../../common/events/app-events';
 
 interface IncomingMessageContext {
   tenantId: string;
@@ -10,15 +18,6 @@ interface IncomingMessageContext {
   messageText: string;
 }
 
-/**
- * Orquestra as automações quando uma mensagem chega.
- *
- * Prioridade:
- * 1. Se está fora do horário -> mensagem de fora do horário
- * 2. Tenta casar com FAQ (palavras-chave)
- * 3. Se cair em regra de handoff -> escala pra humano
- * 4. Senão, aciona IA com acesso ao catálogo
- */
 @Injectable()
 export class AutomationsService {
   private readonly logger = new Logger(AutomationsService.name);
@@ -26,7 +25,8 @@ export class AutomationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ai: AiService,
-    private readonly whatsapp: WhatsappService,
+    private readonly intentClassifier: IntentClassifier,
+    private readonly events: EventEmitter2,
   ) {}
 
   async handleIncomingMessage(ctx: IncomingMessageContext) {
@@ -34,23 +34,20 @@ export class AutomationsService {
       where: { tenantId: ctx.tenantId },
     });
 
-    if (!settings?.aiEnabled) {
-      this.logger.debug(`IA desabilitada para tenant ${ctx.tenantId}`);
-      return;
+    if (this.matchesHandoffKeyword(ctx.messageText, settings?.handoffKeywords ?? [])) {
+      return this.requestHandoff(ctx, 'keyword match');
     }
 
-    // 1. Verifica palavras-chave de handoff (ex: "falar com atendente")
-    if (this.matchesHandoffKeyword(ctx.messageText, settings.handoffKeywords)) {
-      return this.handoffToHuman(ctx, 'keyword match');
-    }
-
-    // 2. Tenta casar com FAQ
     const faqAnswer = await this.tryFaqMatch(ctx.tenantId, ctx.messageText);
     if (faqAnswer) {
-      return this.sendBotReply(ctx, faqAnswer);
+      return this.requestOutboundMessage(ctx, faqAnswer, true);
     }
 
-    // 3. Fallback: IA com function calling no catálogo
+    if (!settings?.aiEnabled) {
+      this.logger.debug(`IA desabilitada para tenant ${ctx.tenantId} — sem resposta automática`);
+      return this.requestHandoff(ctx, 'ai disabled and no faq match');
+    }
+
     try {
       const aiReply = await this.ai.generateReply({
         tenantId: ctx.tenantId,
@@ -60,23 +57,22 @@ export class AutomationsService {
       });
 
       if (aiReply.handoff) {
-        return this.handoffToHuman(ctx, 'ai requested handoff');
+        return this.requestHandoff(ctx, aiReply.handoffReason ?? 'ai requested handoff');
       }
 
       if (aiReply.text) {
-        return this.sendBotReply(ctx, aiReply.text);
+        return this.requestOutboundMessage(ctx, aiReply.text, true);
       }
     } catch (error) {
       this.logger.error(`Erro na IA: ${(error as Error).message}`);
-      // Fallback seguro: escala pra humano
-      return this.handoffToHuman(ctx, 'ai error');
+      return this.requestHandoff(ctx, 'ai error');
     }
   }
 
   private matchesHandoffKeyword(text: string, keywords: string[]): boolean {
     if (!keywords?.length) return false;
     const normalized = text.toLowerCase();
-    return keywords.some((k) => normalized.includes(k.toLowerCase()));
+    return keywords.some((k: string) => normalized.includes(k.toLowerCase()));
   }
 
   private async tryFaqMatch(tenantId: string, text: string): Promise<string | null> {
@@ -86,44 +82,54 @@ export class AutomationsService {
     });
 
     const normalized = text.toLowerCase();
-    for (const faq of faqs) {
-      const hit = faq.keywords.some((kw) => normalized.includes(kw.toLowerCase()));
-      if (hit) return faq.answer;
+    const matches = (faqs as Faq[]).filter((faq) =>
+      faq.keywords.some((kw: string) => normalized.includes(kw.toLowerCase())),
+    );
+
+    if (matches.length === 0) return null;
+
+    const candidates: FaqCandidate[] = matches.map((f) => ({
+      id: f.id,
+      question: f.question,
+      keywords: f.keywords,
+    }));
+
+    const classification = await this.intentClassifier.classify(text, candidates);
+
+    if (!classification.matched) {
+      this.logger.debug(
+        `[faq] keyword bateu mas intenção não é FAQ: "${classification.reason}"`,
+      );
+      return null;
     }
-    return null;
+
+    const chosen = matches.find((f) => f.id === classification.faqId);
+    if (!chosen) return null;
+
+    this.logger.debug(
+      `[faq] match confirmado | faq="${chosen.question}" confianca=${classification.confidence}`,
+    );
+    return chosen.answer;
   }
 
-  private async sendBotReply(ctx: IncomingMessageContext, text: string) {
-    const contact = await this.prisma.contact.findUniqueOrThrow({
-      where: { id: ctx.contactId },
-    });
-
-    const result = await this.whatsapp.sendText(ctx.tenantId, contact.phone, text);
-
-    await this.prisma.message.create({
-      data: {
-        tenantId: ctx.tenantId,
-        conversationId: ctx.conversationId,
-        contactId: ctx.contactId,
-        externalId: result.externalId,
-        direction: 'OUTBOUND',
-        type: 'TEXT',
-        content: text,
-        status: result.status === 'FAILED' ? 'FAILED' : 'SENT',
-        fromBot: true,
-      },
-    });
+  private requestOutboundMessage(ctx: IncomingMessageContext, text: string, fromBot: boolean) {
+    const payload: OutboundMessageRequestedEvent = {
+      tenantId: ctx.tenantId,
+      conversationId: ctx.conversationId,
+      contactId: ctx.contactId,
+      text,
+      fromBot,
+    };
+    this.events.emit(APP_EVENTS.OUTBOUND_MESSAGE_REQUESTED, payload);
   }
 
-  private async handoffToHuman(ctx: IncomingMessageContext, reason: string) {
-    this.logger.log(`Handoff para humano | conversa=${ctx.conversationId} motivo=${reason}`);
-
-    await this.prisma.conversation.update({
-      where: { id: ctx.conversationId },
-      data: { status: 'HUMAN' },
-    });
-
-    // Aqui poderia disparar notificação Socket.IO pro painel
-    // e/ou enviar mensagem pro lojista no WhatsApp pessoal dele
+  private requestHandoff(ctx: IncomingMessageContext, reason: string) {
+    this.logger.log(`Handoff solicitado | conversa=${ctx.conversationId} motivo=${reason}`);
+    const payload: ConversationHandoffRequestedEvent = {
+      tenantId: ctx.tenantId,
+      conversationId: ctx.conversationId,
+      reason,
+    };
+    this.events.emit(APP_EVENTS.CONVERSATION_HANDOFF_REQUESTED, payload);
   }
 }

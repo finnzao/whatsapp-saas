@@ -9,9 +9,9 @@ export interface Product {
   name: string;
   description?: string;
   sku?: string;
-  price: string;
-  priceCash?: string;
-  priceInstallment?: string;
+  price: string | number;
+  priceCash?: string | number;
+  priceInstallment?: string | number;
   installments?: number;
   stock: number;
   trackStock: boolean;
@@ -22,6 +22,7 @@ export interface Product {
   paused: boolean;
   category?: { id: string; name: string };
   categoryId?: string;
+  customFields?: Record<string, unknown> | null;
 }
 
 interface ProductsResponse {
@@ -38,6 +39,17 @@ export function useProducts(search?: string) {
       });
       return data;
     },
+  });
+}
+
+export function useProduct(id: string | null) {
+  return useQuery({
+    queryKey: ['product', id],
+    queryFn: async () => {
+      const { data } = await api.get<Product>(`/products/${id}`);
+      return data;
+    },
+    enabled: !!id,
   });
 }
 
@@ -71,6 +83,22 @@ export function useCreateProduct() {
   });
 }
 
+export function useUpdateProduct() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, ...payload }: Partial<Product> & { id: string }) => {
+      const { data } = await api.patch<Product>(`/products/${id}`, payload);
+      return data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['products'] });
+      qc.invalidateQueries({ queryKey: ['product', vars.id] });
+      toast.success('Produto atualizado');
+    },
+    onError: (e) => toast.error(extractApiError(e)),
+  });
+}
+
 export function useDeleteProduct() {
   const qc = useQueryClient();
   return useMutation({
@@ -82,5 +110,15 @@ export function useDeleteProduct() {
       toast.success('Produto removido');
     },
     onError: (e) => toast.error(extractApiError(e)),
+  });
+}
+
+export function useCategories() {
+  return useQuery({
+    queryKey: ['categories'],
+    queryFn: async () => {
+      const { data } = await api.get<Array<{ id: string; name: string }>>('/categories');
+      return data;
+    },
   });
 }

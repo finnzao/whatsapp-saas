@@ -1,46 +1,65 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe, Logger } from '@nestjs/common';
-import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import helmet from 'helmet';
+import { ValidationPipe, Logger, LogLevel } from '@nestjs/common';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 
-async function bootstrap() {
-  const logger = new Logger('Bootstrap');
-  const app = await NestFactory.create(AppModule);
+function getLogLevels(): LogLevel[] {
+  const isDev = process.env.NODE_ENV !== 'production';
+  const custom = process.env.LOG_LEVEL;
 
-  app.use(helmet());
+  if (custom) {
+    return custom.split(',').map((s) => s.trim()) as LogLevel[];
+  }
+
+  if (isDev) {
+    return ['error', 'warn', 'log', 'debug'];
+  }
+
+  return ['error', 'warn', 'log'];
+}
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule, {
+    logger: getLogLevels(),
+  });
 
   app.enableCors({
-    origin: process.env.CORS_ORIGIN?.split(',') ?? 'http://localhost:3000',
+    origin: process.env.CORS_ORIGIN?.split(',') ?? ['http://localhost:3000'],
     credentials: true,
   });
 
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
-      forbidNonWhitelisted: true,
       transform: true,
-      transformOptions: { enableImplicitConversion: true },
+      forbidNonWhitelisted: false,
     }),
   );
 
-  // Swagger em dev
-  if (process.env.NODE_ENV !== 'production') {
-    const config = new DocumentBuilder()
-      .setTitle('WhatsApp SaaS API')
-      .setDescription('API de atendimento WhatsApp + IA para varejo')
-      .setVersion('0.1.0')
-      .addBearerAuth()
-      .build();
-    const document = SwaggerModule.createDocument(app, config);
-    SwaggerModule.setup('docs', app, document);
-  }
+  app.setGlobalPrefix('', { exclude: ['health'] });
 
-  const port = Number(process.env.PORT) || 3001;
+  const config = new DocumentBuilder()
+    .setTitle('WhatsApp SaaS API')
+    .setDescription('Backend para atendimento automatizado via WhatsApp')
+    .setVersion('1.0')
+    .addBearerAuth()
+    .build();
+  const document = SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('docs', app, document);
+
+  const port = process.env.PORT ?? 3001;
   await app.listen(port);
 
-  logger.log(`API rodando em http://localhost:${port}`);
-  logger.log(`Docs: http://localhost:${port}/docs`);
+  const logger = new Logger('Bootstrap');
+  logger.log(`🚀 API pronta em http://localhost:${port}`);
+  logger.log(`📚 Docs em http://localhost:${port}/docs`);
+
+  const isDev = process.env.NODE_ENV !== 'production';
+  if (isDev) {
+    logger.log(
+      `💡 Logs: ${process.env.PRISMA_LOG === 'query' ? 'SQL verboso ligado' : 'SQL silencioso (PRISMA_LOG=query para ligar)'}`,
+    );
+  }
 }
 
 bootstrap();

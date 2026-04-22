@@ -1,5 +1,6 @@
 import { Injectable, ConflictException, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -24,8 +25,7 @@ export class AuthService {
     const slug = this.slugify(dto.tenantName);
     const hashedPassword = await bcrypt.hash(dto.password, 10);
 
-    // Cria tenant + usuário owner em transação
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const tenant = await tx.tenant.create({
         data: {
           name: dto.tenantName,

@@ -8,6 +8,7 @@ import {
   Min,
   IsEnum,
   IsUUID,
+  IsObject,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
@@ -91,7 +92,15 @@ export class CreateProductDto {
 
   @ApiPropertyOptional()
   @IsOptional()
+  @IsObject()
   specifications?: Record<string, any>;
+
+  @ApiPropertyOptional({
+    description: 'Valores dos campos personalizados definidos pelo tenant',
+  })
+  @IsOptional()
+  @IsObject()
+  customFields?: Record<string, any>;
 }
 
 export class UpdateProductDto extends PartialType(CreateProductDto) {

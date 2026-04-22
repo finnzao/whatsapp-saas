@@ -12,22 +12,38 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { IsEnum, IsOptional } from 'class-validator';
-import { OrderStatus, PaymentStatus } from '@prisma/client';
+import { $Enums } from '@prisma/client';
 
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentTenant } from '../../common/decorators/current-tenant.decorator';
 
+const OrderStatusValues = [
+  'PENDING',
+  'CONFIRMED',
+  'PREPARING',
+  'SHIPPED',
+  'DELIVERED',
+  'CANCELLED',
+] as const;
+
+const PaymentStatusValues = ['PENDING', 'PAID', 'REFUNDED', 'FAILED'] as const;
+
 export class UpdateOrderStatusDto {
-  @IsOptional() @IsEnum(OrderStatus) status?: OrderStatus;
-  @IsOptional() @IsEnum(PaymentStatus) paymentStatus?: PaymentStatus;
+  @IsOptional()
+  @IsEnum(OrderStatusValues)
+  status?: $Enums.OrderStatus;
+
+  @IsOptional()
+  @IsEnum(PaymentStatusValues)
+  paymentStatus?: $Enums.PaymentStatus;
 }
 
 @Injectable()
 export class OrdersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  list(tenantId: string, status?: OrderStatus) {
+  list(tenantId: string, status?: $Enums.OrderStatus) {
     return this.prisma.order.findMany({
       where: { tenantId, ...(status && { status }) },
       include: {
@@ -66,7 +82,7 @@ export class OrdersController {
   constructor(private readonly service: OrdersService) {}
 
   @Get()
-  list(@CurrentTenant() tenantId: string, @Query('status') status?: OrderStatus) {
+  list(@CurrentTenant() tenantId: string, @Query('status') status?: $Enums.OrderStatus) {
     return this.service.list(tenantId, status);
   }
 

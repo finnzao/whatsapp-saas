@@ -1,46 +1,92 @@
 'use client';
 
+import { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
 import Link from 'next/link';
-import { useLogin } from '@/lib/hooks/useAuth';
-
-interface LoginForm {
-  email: string;
-  password: string;
-}
+import { Mail } from 'lucide-react';
+import {
+  useLogin,
+  useAuthHydrated,
+  useIsAuthenticated,
+} from '@/lib/hooks/useAuth';
+import { loginSchema, type LoginInput } from '@/lib/validation/schemas';
+import { ValidatedInput } from '@/components/ui/ValidatedInput';
 
 export default function LoginPage() {
-  const { register, handleSubmit, formState: { errors } } = useForm<LoginForm>();
+  const hydrated = useAuthHydrated();
+  const isAuthenticated = useIsAuthenticated();
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, touchedFields, dirtyFields, isSubmitting },
+  } = useForm<LoginInput>({
+    resolver: zodResolver(loginSchema),
+    mode: 'onBlur',
+  });
+
   const login = useLogin();
 
-  const onSubmit = (data: LoginForm) => login.mutate(data);
+  useEffect(() => {
+    if (hydrated && isAuthenticated) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[LoginPage] já autenticado, redirect → /conversas');
+      }
+      window.location.assign('/conversas');
+    }
+  }, [hydrated, isAuthenticated]);
+
+  const onSubmit = (data: LoginInput) => {
+    if (login.isPending || login.isSuccess) return;
+    login.mutate(data);
+  };
+
+  const emailValid = !errors.email && (touchedFields.email || dirtyFields.email);
+  const passwordValid = !errors.password && (touchedFields.password || dirtyFields.password);
+
+  if (hydrated && isAuthenticated) {
+    return (
+      <div className="flex items-center justify-center py-10 text-sm text-gray-500">
+        Redirecionando...
+      </div>
+    );
+  }
 
   return (
     <div>
       <h2 className="mb-6 text-xl font-semibold text-gray-900">Entrar</h2>
-      <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
-        <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">E-mail</label>
-          <input
-            type="email"
-            className="input"
-            placeholder="voce@loja.com"
-            {...register('email', { required: 'E-mail obrigatório' })}
-          />
-          {errors.email && <p className="mt-1 text-xs text-red-600">{errors.email.message}</p>}
-        </div>
-        <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">Senha</label>
-          <input
-            type="password"
-            className="input"
-            placeholder="••••••••"
-            {...register('password', { required: 'Senha obrigatória' })}
-          />
-          {errors.password && <p className="mt-1 text-xs text-red-600">{errors.password.message}</p>}
-        </div>
-        <button type="submit" className="btn-primary w-full" disabled={login.isPending}>
-          {login.isPending ? 'Entrando...' : 'Entrar'}
+      <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
+        <ValidatedInput
+          label="E-mail"
+          type="email"
+          autoComplete="email"
+          placeholder="voce@loja.com"
+          error={errors.email?.message}
+          isValid={emailValid}
+          showValidIcon
+          rightElement={<Mail className="h-4 w-4 text-gray-400" />}
+          {...register('email')}
+        />
+        <ValidatedInput
+          label="Senha"
+          type="password"
+          autoComplete="current-password"
+          placeholder="••••••••"
+          error={errors.password?.message}
+          isValid={passwordValid}
+          {...register('password')}
+        />
+        <button
+          type="submit"
+          className="btn-primary w-full"
+          disabled={isSubmitting || login.isPending || login.isSuccess}
+        >
+          {login.isPending
+            ? 'Entrando...'
+            : login.isSuccess
+              ? 'Redirecionando...'
+              : 'Entrar'}
         </button>
       </form>
       <p className="mt-6 text-center text-sm text-gray-600">
