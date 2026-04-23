@@ -55,7 +55,7 @@ export class CatalogTools {
         name: 'search_products',
         description:
           'USE SEMPRE QUE O CLIENTE PERGUNTAR SOBRE PRODUTOS. Busca no catálogo por nome, marca, modelo, categoria, cor, tamanho, voltagem ou qualquer característica. Aceita texto livre com várias palavras. Exemplos de chamada: query="iphone laranja", query="camisa azul tamanho M", query="notebook gamer até 3000". Esta é a ferramenta que você deve chamar quando o cliente perguntar "tem X?", "quero um Y", "vocês vendem Z?".',
-        input_schema: {
+        parameters: {
           type: 'object' as const,
           properties: {
             query: {
@@ -74,7 +74,7 @@ export class CatalogTools {
         name: 'check_product_availability',
         description:
           'NÃO use esta ferramenta para perguntas iniciais do cliente. Use APENAS depois de search_products, para checar se um produto específico que você já encontrou ainda tem estoque. O productId DEVE ser um UUID válido retornado por search_products em uma chamada anterior desta conversa. NUNCA invente productId, NUNCA passe o nome do produto como productId.',
-        input_schema: {
+        parameters: {
           type: 'object' as const,
           properties: {
             productId: {
@@ -90,13 +90,13 @@ export class CatalogTools {
         name: 'list_categories',
         description:
           'Lista as categorias de produtos da loja. Use quando o cliente perguntar "quais categorias vocês têm?" ou "o que vocês vendem?" de forma genérica.',
-        input_schema: { type: 'object' as const, properties: {} },
+        parameters: { type: 'object' as const, properties: {} },
       },
       {
         name: 'request_human_handoff',
         description:
           'Transfere a conversa para um atendente humano. Use quando o cliente pedir explicitamente, estiver muito irritado, ou em casos complexos (reclamação de pedido, problema técnico grave, negociação de desconto).',
-        input_schema: {
+        parameters: {
           type: 'object' as const,
           properties: {
             reason: { type: 'string', description: 'Motivo da transferência' },

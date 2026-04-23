@@ -117,7 +117,7 @@ export class AiAgentService {
 
           toolResults.push({
             type: 'tool_result',
-            toolUseId: call.id,
+            tool_use_id: call.id,
             content: JSON.stringify(result),
           });
         }
