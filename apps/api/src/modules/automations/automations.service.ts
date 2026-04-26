@@ -18,6 +18,9 @@ interface IncomingMessageContext {
   messageText: string;
 }
 
+const AI_TECHNICAL_FALLBACK =
+  'Desculpe, tive um probleminha pra processar isso agora. Pode repetir ou me dar mais detalhes do que você procura?';
+
 @Injectable()
 export class AutomationsService {
   private readonly logger = new Logger(AutomationsService.name);
@@ -63,9 +66,16 @@ export class AutomationsService {
       if (aiReply.text) {
         return this.requestOutboundMessage(ctx, aiReply.text, true);
       }
+
+      this.logger.warn(
+        `[automations] IA retornou resposta vazia para "${ctx.messageText.slice(0, 60)}" — enviando fallback`,
+      );
+      return this.requestOutboundMessage(ctx, AI_TECHNICAL_FALLBACK, true);
     } catch (error) {
-      this.logger.error(`Erro na IA: ${(error as Error).message}`);
-      return this.requestHandoff(ctx, 'ai error');
+      this.logger.error(
+        `[automations] Erro técnico na IA para conversa ${ctx.conversationId}: ${(error as Error).message}`,
+      );
+      return this.requestOutboundMessage(ctx, AI_TECHNICAL_FALLBACK, true);
     }
   }
 

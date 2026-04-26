@@ -111,22 +111,77 @@ export const registerSchema = z.object({
   tenantName: fields.name(2, 80),
 });
 
-export const productSchema = z.object({
-  name: fields.name(2, 200),
-  description: z.string().max(2000).optional().or(z.literal('')),
-  categoryId: z.string().uuid().optional().or(z.literal('')),
-  sku: fields.sku(),
-  price: fields.money(0.01),
-  priceCash: fields.money().optional(),
-  priceInstallment: fields.money().optional(),
-  installments: z.number().int().min(1).max(24).optional(),
-  stock: fields.stock(),
-  trackStock: z.boolean().optional(),
-  condition: z.enum(['NEW', 'SEMINEW', 'USED', 'SHOWCASE', 'REFURBISHED']).optional(),
-  warranty: z.string().max(200).optional().or(z.literal('')),
-  images: z.array(fields.url()).optional(),
-  customFields: z.record(z.unknown()).optional(),
-});
+export const productSchema = z
+  .object({
+    name: fields.name(2, 200),
+    description: z.string().max(2000).optional().or(z.literal('')),
+    categoryId: z.string().uuid().optional().or(z.literal('')),
+    sku: fields.sku(),
+    price: fields.money(0.01),
+    priceCash: z
+      .number({ invalid_type_error: MESSAGES.money })
+      .min(0, MESSAGES.nonNegative)
+      .optional()
+      .nullable(),
+    priceInstallment: z
+      .number({ invalid_type_error: MESSAGES.money })
+      .min(0, MESSAGES.nonNegative)
+      .optional()
+      .nullable(),
+    installments: z
+      .number()
+      .int()
+      .min(1, 'Mínimo 1 parcela')
+      .max(24, 'Máximo 24 parcelas')
+      .optional()
+      .nullable(),
+    stock: fields.stock(),
+    trackStock: z.boolean().optional(),
+    condition: z.enum(['NEW', 'SEMINEW', 'USED', 'SHOWCASE', 'REFURBISHED']).optional(),
+    warranty: z.string().max(200).optional().or(z.literal('')),
+    images: z.array(fields.url()).optional(),
+    customFields: z.record(z.unknown()).optional(),
+  })
+  .superRefine((data, ctx) => {
+    // Parcelamento só faz sentido com os dois campos juntos.
+    const hasInstallments =
+      data.installments !== null && data.installments !== undefined && data.installments > 0;
+    const hasInstallmentPrice =
+      data.priceInstallment !== null &&
+      data.priceInstallment !== undefined &&
+      data.priceInstallment > 0;
+
+    if (hasInstallments && !hasInstallmentPrice) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['priceInstallment'],
+        message: 'Informe o valor total parcelado para calcular as parcelas',
+      });
+    }
+    if (hasInstallmentPrice && !hasInstallments) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['installments'],
+        message: 'Informe em quantas parcelas o valor será dividido',
+      });
+    }
+
+    // Se tem parcelamento mas o valor parcelado é menor que o preço base,
+    // provavelmente é engano do usuário (parcelamento normalmente é > à vista).
+    // Warning leve: só avisa, não bloqueia.
+    if (
+      hasInstallmentPrice &&
+      data.priceInstallment! < data.price &&
+      data.priceInstallment! > 0
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['priceInstallment'],
+        message:
+          'O valor parcelado é menor que o preço base. Confira se não é o valor de cada parcela (precisamos do total).',
+      });
+    }
+  });
 
 export const faqSchema = z.object({
   question: fields.text(3, 200),
@@ -146,8 +201,16 @@ export const customFieldDefinitionSchema = z.object({
   helpText: z.string().max(200).optional().or(z.literal('')),
 });
 
+export const categorySchema = z.object({
+  name: fields.name(2, 80),
+  description: z.string().max(200).optional().or(z.literal('')),
+  order: z.number().int().min(0).optional(),
+  active: z.boolean().optional(),
+});
+
 export type LoginInput = z.infer<typeof loginSchema>;
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type ProductInput = z.infer<typeof productSchema>;
 export type FaqInput = z.infer<typeof faqSchema>;
 export type CustomFieldDefinitionInput = z.infer<typeof customFieldDefinitionSchema>;
+export type CategoryInput = z.infer<typeof categorySchema>;

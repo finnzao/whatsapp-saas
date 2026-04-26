@@ -25,10 +25,27 @@ export interface LlmToolCall {
   input: Record<string, unknown>;
 }
 
+/**
+ * Controla se/como o modelo deve chamar ferramentas.
+ * - 'auto' (default): modelo decide.
+ * - 'any': modelo DEVE chamar alguma ferramenta (qualquer uma).
+ * - 'none': modelo não pode chamar ferramentas.
+ * - { name }: força uma ferramenta específica.
+ *
+ * Nem todo provider suporta todos os modos. Providers que não entendem
+ * um modo específico caem em 'auto'.
+ */
+export type LlmToolChoice =
+  | 'auto'
+  | 'any'
+  | 'none'
+  | { type: 'tool'; name: string };
+
 export interface LlmCompletionRequest {
   system?: string;
   messages: LlmMessage[];
   tools?: LlmToolDefinition[];
+  toolChoice?: LlmToolChoice;
   maxTokens?: number;
   temperature?: number;
   stopSequences?: string[];

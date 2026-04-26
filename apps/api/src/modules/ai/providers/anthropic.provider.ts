@@ -8,6 +8,7 @@ import {
   LlmCompletionResponse,
   LlmMessage,
   LlmToolCall,
+  LlmToolChoice,
 } from './llm-provider.interface';
 
 @Injectable()
@@ -49,6 +50,9 @@ export class AnthropicProvider implements LlmProvider {
           description: t.description,
           input_schema: t.parameters,
         })),
+        ...(request.toolChoice && {
+          tool_choice: this.mapToolChoice(request.toolChoice),
+        }),
       }),
     });
 
@@ -76,6 +80,16 @@ export class AnthropicProvider implements LlmProvider {
         outputTokens: response.usage.output_tokens,
       },
     };
+  }
+
+  private mapToolChoice(choice: LlmToolChoice): any {
+    if (choice === 'auto') return { type: 'auto' };
+    if (choice === 'any') return { type: 'any' };
+    if (choice === 'none') return { type: 'none' };
+    if (typeof choice === 'object' && choice.type === 'tool') {
+      return { type: 'tool', name: choice.name };
+    }
+    return { type: 'auto' };
   }
 
   private toAnthropicMessages(messages: LlmMessage[]): Anthropic.MessageParam[] {

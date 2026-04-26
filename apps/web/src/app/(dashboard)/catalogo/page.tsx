@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { useForm, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import {
@@ -15,6 +16,8 @@ import {
   Box,
   DollarSign,
   Sparkles,
+  ExternalLink,
+  Calculator,
 } from 'lucide-react';
 import {
   useProducts,
@@ -28,9 +31,14 @@ import {
 import { useCustomFieldDefinitions } from '@/lib/hooks/useCustomFields';
 import { cn, formatCurrency } from '@/lib/utils';
 import { productSchema, type ProductInput } from '@/lib/validation/schemas';
-import { maskSku } from '@/lib/validation/masks';
+import {
+  maskSku,
+  calculateInstallmentValue,
+  formatCurrencyBrl,
+} from '@/lib/validation/masks';
 import { ValidatedInput } from '@/components/ui/ValidatedInput';
 import { ValidatedTextarea } from '@/components/ui/ValidatedTextarea';
+import { MoneyInput } from '@/components/ui/MoneyInput';
 import { CustomFieldRenderer } from '@/components/ui/CustomFieldRenderer';
 
 export default function CatalogoPage() {
@@ -221,9 +229,9 @@ function ProductModal({ product, onClose }: { product: Product | null; onClose: 
     categoryId: product?.categoryId ?? '',
     sku: product?.sku ?? '',
     price: product ? Number(product.price) : undefined,
-    priceCash: product?.priceCash ? Number(product.priceCash) : undefined,
-    priceInstallment: product?.priceInstallment ? Number(product.priceInstallment) : undefined,
-    installments: product?.installments ?? undefined,
+    priceCash: product?.priceCash ? Number(product.priceCash) : null,
+    priceInstallment: product?.priceInstallment ? Number(product.priceInstallment) : null,
+    installments: product?.installments ?? null,
     stock: product?.stock ?? 0,
     trackStock: product?.trackStock ?? true,
     condition: (product?.condition as ProductInput['condition']) ?? 'NEW',
@@ -235,7 +243,6 @@ function ProductModal({ product, onClose }: { product: Product | null; onClose: 
     register,
     handleSubmit,
     control,
-    setValue,
     watch,
     formState: { errors, isSubmitting },
   } = useForm<ProductInput>({
@@ -244,7 +251,13 @@ function ProductModal({ product, onClose }: { product: Product | null; onClose: 
     mode: 'onBlur',
   });
 
-  const customFieldValues = watch('customFields') ?? {};
+  // Observa parcelamento pra calcular valor da parcela em tempo real.
+  const priceInstallmentWatch = watch('priceInstallment');
+  const installmentsWatch = watch('installments');
+  const installmentValue = calculateInstallmentValue(
+    priceInstallmentWatch ?? null,
+    installmentsWatch ?? null,
+  );
 
   const onSubmit = (data: ProductInput) => {
     const payload = {
@@ -253,6 +266,9 @@ function ProductModal({ product, onClose }: { product: Product | null; onClose: 
       sku: data.sku || undefined,
       warranty: data.warranty || undefined,
       description: data.description || undefined,
+      priceCash: data.priceCash ?? undefined,
+      priceInstallment: data.priceInstallment ?? undefined,
+      installments: data.installments ?? undefined,
     };
 
     if (isEditing) {
@@ -368,47 +384,94 @@ function ProductModal({ product, onClose }: { product: Product | null; onClose: 
             {tab === 'pricing' && (
               <div className="space-y-4">
                 <div className="grid grid-cols-2 gap-3">
-                  <ValidatedInput
-                    label="Preço (R$)"
-                    required
-                    type="number"
-                    step="0.01"
-                    min="0.01"
-                    placeholder="0,00"
-                    error={errors.price?.message}
-                    {...register('price', { valueAsNumber: true })}
+                  <Controller
+                    control={control}
+                    name="price"
+                    render={({ field, fieldState }) => (
+                      <MoneyInput
+                        label="Preço"
+                        required
+                        value={field.value ?? null}
+                        onChange={(n) => field.onChange(n ?? undefined)}
+                        onBlur={field.onBlur}
+                        error={fieldState.error?.message}
+                        helpText="Preço de tabela do produto"
+                      />
+                    )}
                   />
-                  <ValidatedInput
-                    label="Preço à vista (R$)"
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    placeholder="Opcional"
-                    helpText="Com desconto PIX/dinheiro"
-                    error={errors.priceCash?.message}
-                    {...register('priceCash', { valueAsNumber: true })}
+                  <Controller
+                    control={control}
+                    name="priceCash"
+                    render={({ field, fieldState }) => (
+                      <MoneyInput
+                        label="Preço à vista"
+                        value={field.value ?? null}
+                        onChange={field.onChange}
+                        onBlur={field.onBlur}
+                        error={fieldState.error?.message}
+                        helpText="Opcional — com desconto PIX/dinheiro"
+                      />
+                    )}
                   />
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <ValidatedInput
-                    label="Preço parcelado (R$)"
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    placeholder="Opcional"
-                    error={errors.priceInstallment?.message}
-                    {...register('priceInstallment', { valueAsNumber: true })}
-                  />
-                  <ValidatedInput
-                    label="Parcelas"
-                    type="number"
-                    min="1"
-                    max="24"
-                    placeholder="Ex: 12"
-                    error={errors.installments?.message}
-                    {...register('installments', { valueAsNumber: true })}
-                  />
+                <div className="rounded-lg border border-gray-200 bg-gray-50/50 p-4">
+                  <div className="mb-3 flex items-center gap-2">
+                    <Calculator className="h-4 w-4 text-gray-500" />
+                    <h3 className="text-sm font-medium text-gray-700">Parcelamento</h3>
+                    <span className="text-xs text-gray-500">(opcional)</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <Controller
+                      control={control}
+                      name="priceInstallment"
+                      render={({ field, fieldState }) => (
+                        <MoneyInput
+                          label="Valor total parcelado"
+                          value={field.value ?? null}
+                          onChange={field.onChange}
+                          onBlur={field.onBlur}
+                          error={fieldState.error?.message}
+                          helpText="Total que o cliente paga no parcelado"
+                        />
+                      )}
+                    />
+                    <ValidatedInput
+                      label="Número de parcelas"
+                      type="number"
+                      min="1"
+                      max="24"
+                      placeholder="Ex: 12"
+                      error={errors.installments?.message}
+                      helpText="Entre 1 e 24"
+                      {...register('installments', {
+                        setValueAs: (v) => (v === '' || v === null ? null : Number(v)),
+                      })}
+                    />
+                  </div>
+
+                  {/* Exibição do valor da parcela calculado — read-only, atualiza ao vivo */}
+                  <div className="mt-3 flex items-center justify-between rounded-md border border-gray-200 bg-white px-3 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-gray-600">Cada parcela ficará em</span>
+                    </div>
+                    <span
+                      className={cn(
+                        'text-sm font-semibold',
+                        installmentValue !== null ? 'text-brand-700' : 'text-gray-400',
+                      )}
+                    >
+                      {installmentValue !== null
+                        ? `${installmentsWatch}× ${formatCurrencyBrl(installmentValue)}`
+                        : '—'}
+                    </span>
+                  </div>
+                  {installmentValue === null && (priceInstallmentWatch || installmentsWatch) && (
+                    <p className="mt-2 text-xs text-amber-700">
+                      Preencha os dois campos acima para calcular.
+                    </p>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -436,15 +499,36 @@ function ProductModal({ product, onClose }: { product: Product | null; onClose: 
 
             {tab === 'custom' && (
               <div className="space-y-4">
+                <div className="flex items-start justify-between gap-3 rounded-md border border-brand-100 bg-brand-50/60 p-3">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-brand-900">
+                      Precisa de um campo que não existe?
+                    </p>
+                    <p className="mt-0.5 text-xs text-brand-800/70">
+                      Crie campos novos em Configurações e eles aparecem aqui automaticamente.
+                    </p>
+                  </div>
+                  <Link
+                    href="/configuracoes?tab=custom-fields&new=field"
+                    target="_blank"
+                    rel="noopener"
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-white px-2.5 py-1.5 text-xs font-medium text-brand-700 shadow-sm ring-1 ring-brand-200 transition hover:bg-brand-50"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Criar novo campo
+                    <ExternalLink className="h-3 w-3 opacity-60" />
+                  </Link>
+                </div>
+
                 {customFields.length === 0 ? (
                   <div className="rounded-lg border-2 border-dashed border-gray-300 p-6 text-center">
                     <Sparkles className="mx-auto h-8 w-8 text-gray-300" />
                     <h3 className="mt-2 text-sm font-medium text-gray-900">
-                      Nenhum campo personalizado
+                      Nenhum campo personalizado ainda
                     </h3>
                     <p className="mt-1 text-xs text-gray-500">
-                      Vá em Configurações → Campos personalizados para criar campos como "Cor",
-                      "Tamanho", "Material", etc. Esses campos aparecem aqui para cada produto.
+                      Clique em "Criar novo campo" acima para adicionar campos como Cor,
+                      Tamanho, Material, etc.
                     </p>
                   </div>
                 ) : (

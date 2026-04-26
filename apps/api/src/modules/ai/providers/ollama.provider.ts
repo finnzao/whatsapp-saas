@@ -1,12 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosError } from 'axios';
 
 import {
   LlmProvider,
   LlmCompletionRequest,
   LlmCompletionResponse,
   LlmToolCall,
+  LlmToolChoice,
 } from './llm-provider.interface';
 
 interface OllamaChatMessage {
@@ -40,6 +41,13 @@ export class OllamaProvider implements LlmProvider {
   private readonly model: string;
   private readonly baseUrl: string;
 
+  /**
+   * Se o Ollama rejeitar o payload com `tools` (alguns modelos retornam 400),
+   * marcamos aqui pra não tentar de novo nesta sessão — evita latência extra
+   * a cada mensagem.
+   */
+  private toolCallingKnownBroken = false;
+
   constructor(private readonly config: ConfigService) {
     this.baseUrl = this.config.get<string>('OLLAMA_BASE_URL', 'http://localhost:11434');
     this.model = this.config.get<string>('OLLAMA_MODEL', 'llama3.1:8b');
@@ -52,6 +60,7 @@ export class OllamaProvider implements LlmProvider {
   }
 
   supportsToolCalling(): boolean {
+    if (this.toolCallingKnownBroken) return false;
     const toolCapableModels = [
       'llama3.1', 'llama3.2', 'llama3.3',
       'qwen2.5', 'qwen3',
@@ -78,9 +87,28 @@ export class OllamaProvider implements LlmProvider {
   }
 
   async complete(request: LlmCompletionRequest): Promise<LlmCompletionResponse> {
-    const hasTools = !!(request.tools && request.tools.length > 0 && this.supportsToolCalling());
+    const wantsTools = !!(request.tools && request.tools.length > 0 && this.supportsToolCalling());
 
-    const messages = this.toOllamaMessages(request, hasTools);
+    try {
+      return await this.doComplete(request, wantsTools);
+    } catch (err) {
+      if (wantsTools && this.isPayloadRejected(err)) {
+        this.toolCallingKnownBroken = true;
+        this.logger.warn(
+          `[ollama] modelo "${this.model}" rejeitou payload com tools. Reexecutando SEM tool calling. ` +
+            `Se isso acontecer sempre, troque para um modelo com tool calling confiável (ex: llama3.1:8b, qwen2.5:7b).`,
+        );
+        return this.doComplete(request, false);
+      }
+      throw err;
+    }
+  }
+
+  private async doComplete(
+    request: LlmCompletionRequest,
+    includeTools: boolean,
+  ): Promise<LlmCompletionResponse> {
+    const messages = this.toOllamaMessages(request, includeTools);
 
     const payload: Record<string, unknown> = {
       model: this.model,
@@ -93,18 +121,20 @@ export class OllamaProvider implements LlmProvider {
       },
     };
 
-    if (hasTools) {
+    if (includeTools) {
       payload.tools = request.tools!.map((t) => ({
         type: 'function',
         function: {
           name: t.name,
           description: t.description,
-          parameters: t.parameters,
+          parameters: this.sanitizeParametersSchema(t.parameters),
         },
       }));
     }
 
-    if (request.responseFormat === 'json') {
+    // Ollama não aceita `format: 'json'` junto com `tools` em alguns modelos.
+    // Só setamos `format` quando NÃO há tools.
+    if (request.responseFormat === 'json' && !includeTools) {
       payload.format = 'json';
     }
 
@@ -121,7 +151,7 @@ export class OllamaProvider implements LlmProvider {
 
       const validToolNames = request.tools?.map((t) => t.name) ?? [];
 
-      const { cleanedText, recoveredToolCalls, leakedButInvalid } = hasTools
+      const { cleanedText, recoveredToolCalls, leakedButInvalid } = includeTools
         ? this.recoverLeakedToolCalls(rawText, validToolNames)
         : { cleanedText: rawText, recoveredToolCalls: [], leakedButInvalid: false };
 
@@ -151,11 +181,53 @@ export class OllamaProvider implements LlmProvider {
           outputTokens: data.eval_count ?? 0,
         },
       };
-    } catch (error: any) {
-      const msg = error.response?.data?.error ?? error.message;
+    } catch (error) {
+      const msg = this.formatAxiosError(error);
       this.logger.error(`Erro Ollama: ${msg}`);
-      throw new Error(`Ollama request failed: ${msg}`);
+      // Em erro 4xx, loga um resumo do payload pra facilitar debug — sem
+      // encher o log em ambiente saudável.
+      if (axios.isAxiosError(error) && error.response?.status && error.response.status < 500) {
+        this.logger.debug(
+          `[ollama] payload rejeitado | model=${this.model} includeTools=${includeTools} ` +
+            `toolNames=[${(request.tools ?? []).map((t) => t.name).join(', ')}] ` +
+            `messageRoles=[${messages.map((m) => m.role).join(',')}] ` +
+            `firstMsgContent="${String((messages[0] as any)?.content ?? '').slice(0, 80)}"`,
+        );
+      }
+      // Repropaga com mensagem rica pra camadas acima conseguirem agir.
+      const enriched: Error & { status?: number } = new Error(`Ollama request failed: ${msg}`);
+      if (axios.isAxiosError(error)) enriched.status = error.response?.status;
+      throw enriched;
     }
+  }
+
+  private isPayloadRejected(err: unknown): boolean {
+    if (!axios.isAxiosError(err)) return false;
+    const status = err.response?.status;
+    // 400/422 = payload ruim. 404 pode ser modelo ausente. 500+ não ajuda retentar.
+    return status === 400 || status === 422;
+  }
+
+  private formatAxiosError(error: unknown): string {
+    if (axios.isAxiosError(error)) {
+      const axErr = error as AxiosError<any>;
+      const status = axErr.response?.status;
+      const data = axErr.response?.data;
+      const apiMsg =
+        (typeof data === 'object' && data !== null && 'error' in data ? (data as any).error : null) ??
+        (typeof data === 'string' ? data : null);
+
+      if (axErr.code === 'ECONNREFUSED' || axErr.code === 'ECONNABORTED') {
+        return `não consegui conectar no Ollama em ${this.baseUrl} (${axErr.code}). Está rodando?`;
+      }
+
+      if (status) {
+        return `HTTP ${status} — ${apiMsg ?? axErr.message ?? 'sem detalhes'}`;
+      }
+      return axErr.message || 'erro de rede sem detalhes';
+    }
+    if (error instanceof Error) return error.message;
+    return String(error);
   }
 
   private recoverLeakedToolCalls(
@@ -206,7 +278,7 @@ export class OllamaProvider implements LlmProvider {
     return {
       cleanedText: remaining.trim(),
       recoveredToolCalls: recovered,
-      leakedButInvalid: sawStructuredAttempt && recovered.length === 0 || stillSuspicious,
+      leakedButInvalid: (sawStructuredAttempt && recovered.length === 0) || stillSuspicious,
     };
   }
 
@@ -333,6 +405,76 @@ export class OllamaProvider implements LlmProvider {
       .replace(/,\s*([}\]])/g, '$1');
   }
 
+  /**
+   * Garante que o JSON Schema das tools esteja em um formato que o Ollama aceita.
+   * Problemas observados na prática:
+   * - Tool com `properties: {}` e `required` ausente → alguns parsers rejeitam.
+   *   Solução: adicionar `properties: {}` e NÃO colocar `required` (o campo é opcional).
+   * - Campos extras no schema (ex: `default`, `examples`) → alguns builds rejeitam.
+   *   Solução: pass-through por enquanto; se virar problema, filtrar.
+   * - Schema sem `type` no root → sempre colocar `type: 'object'`.
+   */
+  private sanitizeParametersSchema(parameters: unknown): Record<string, unknown> {
+    if (!parameters || typeof parameters !== 'object') {
+      return { type: 'object', properties: {} };
+    }
+
+    const input = parameters as Record<string, unknown>;
+    const sanitized: Record<string, unknown> = {
+      type: 'object',
+      properties:
+        input.properties && typeof input.properties === 'object'
+          ? (input.properties as Record<string, unknown>)
+          : {},
+    };
+
+    // required só entra se existir, for array e tiver itens.
+    if (Array.isArray(input.required) && input.required.length > 0) {
+      sanitized.required = input.required.filter(
+        (r) => typeof r === 'string' && r.length > 0,
+      );
+    }
+
+    return sanitized;
+  }
+
+  private toolChoiceInstruction(
+    choice: LlmToolChoice | undefined,
+    validToolNames: string[],
+  ): string | null {
+    if (!choice || choice === 'auto') return null;
+
+    if (choice === 'none') {
+      return [
+        '',
+        '',
+        'IMPORTANTE: NÃO chame nenhuma ferramenta nesta resposta. Responda APENAS em texto natural.',
+      ].join('\n');
+    }
+
+    if (choice === 'any') {
+      if (validToolNames.length === 0) return null;
+      return [
+        '',
+        '',
+        `IMPORTANTE: Você DEVE chamar UMA das seguintes ferramentas nesta resposta: ${validToolNames.join(', ')}.`,
+        'Escolha a mais adequada à mensagem do cliente. Não responda em texto antes — chame a ferramenta direto.',
+      ].join('\n');
+    }
+
+    if (typeof choice === 'object' && choice.type === 'tool') {
+      if (!validToolNames.includes(choice.name)) return null;
+      return [
+        '',
+        '',
+        `IMPORTANTE: Você DEVE chamar EXATAMENTE a ferramenta "${choice.name}" nesta resposta.`,
+        'Não responda em texto antes — chame a ferramenta direto.',
+      ].join('\n');
+    }
+
+    return null;
+  }
+
   private toOllamaMessages(
     request: LlmCompletionRequest,
     hasTools: boolean,
@@ -351,6 +493,10 @@ export class OllamaProvider implements LlmProvider {
         '4. NUNCA use check_product_availability como primeira tool — sem ID válido, use search_products.',
         '5. Se decidir chamar uma ferramenta, responda APENAS com a chamada, sem texto antes ou depois.',
       ].join('\n');
+
+      const validToolNames = request.tools?.map((t) => t.name) ?? [];
+      const extra = this.toolChoiceInstruction(request.toolChoice, validToolNames);
+      if (extra) systemContent += extra;
     }
 
     if (systemContent) {
@@ -359,13 +505,17 @@ export class OllamaProvider implements LlmProvider {
 
     for (const m of request.messages) {
       if (typeof m.content === 'string') {
-        result.push({ role: m.role as any, content: m.content });
+        // Ollama não tem role 'tool' fora de tool_calls em alguns modelos.
+        // Coagimos 'tool' → 'user' pra não quebrar o payload.
+        const role = m.role === 'tool' ? 'user' : m.role;
+        result.push({ role: role as any, content: m.content });
         continue;
       }
 
       for (const block of m.content) {
         if (block.type === 'text') {
-          result.push({ role: m.role as any, content: block.text });
+          const role = m.role === 'tool' ? 'user' : m.role;
+          result.push({ role: role as any, content: block.text });
         } else if (block.type === 'tool_use') {
           result.push({
             role: 'assistant',

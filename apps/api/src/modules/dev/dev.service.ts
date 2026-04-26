@@ -161,12 +161,15 @@ export class DevService {
   }
 
   async testSearch(tenantId: string, query: string, limit = 10) {
-    const results = await this.catalog.searchProducts(tenantId, { query, limit });
+    const searchResult = await this.catalog.searchProducts(tenantId, { query, limit });
     return {
       query,
       tokens: this.extractTokens(query),
-      resultsCount: results.length,
-      results,
+      matchQuality: searchResult.matchQuality,
+      totalCandidates: searchResult.totalCandidates,
+      resultsCount: searchResult.results.length,
+      hint: searchResult.hint,
+      results: searchResult.results,
     };
   }
 

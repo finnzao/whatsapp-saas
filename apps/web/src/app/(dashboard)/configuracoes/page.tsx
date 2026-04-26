@@ -1,6 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -40,26 +41,51 @@ import type { CustomFieldDefinition } from '@/components/ui/CustomFieldRenderer'
 
 type Tab = 'whatsapp' | 'ia' | 'faqs' | 'custom-fields';
 
+const TAB_FROM_PARAM: Record<string, Tab> = {
+  whatsapp: 'whatsapp',
+  ia: 'ia',
+  faqs: 'faqs',
+  'custom-fields': 'custom-fields',
+};
+
 export default function ConfiguracoesPage() {
-  const [tab, setTab] = useState<Tab>('whatsapp');
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  // Lê ?tab= da URL (deep-link vindo do modal de produto).
+  const initialTab = (searchParams?.get('tab') ?? '') as string;
+  const [tab, setTab] = useState<Tab>(TAB_FROM_PARAM[initialTab] ?? 'whatsapp');
+
+  // Se a URL pedir explicitamente ?new=field, abre o formulário de novo campo automaticamente.
+  const autoOpenNewField = searchParams?.get('new') === 'field';
+
+  const changeTab = (next: Tab) => {
+    setTab(next);
+    // Limpa query params quando o usuário navega manualmente.
+    const params = new URLSearchParams(searchParams?.toString() ?? '');
+    params.delete('tab');
+    params.delete('new');
+    const qs = params.toString();
+    router.replace(`/configuracoes${qs ? `?${qs}` : ''}`, { scroll: false });
+  };
 
   return (
     <div className="p-6">
       <h1 className="mb-6 text-2xl font-semibold text-gray-900">Configurações</h1>
 
       <div className="mb-6 flex gap-2 border-b border-gray-200">
-        <TabButton active={tab === 'whatsapp'} onClick={() => setTab('whatsapp')} icon={Smartphone}>
+        <TabButton active={tab === 'whatsapp'} onClick={() => changeTab('whatsapp')} icon={Smartphone}>
           WhatsApp
         </TabButton>
-        <TabButton active={tab === 'ia'} onClick={() => setTab('ia')} icon={Bot}>
+        <TabButton active={tab === 'ia'} onClick={() => changeTab('ia')} icon={Bot}>
           Inteligência Artificial
         </TabButton>
-        <TabButton active={tab === 'faqs'} onClick={() => setTab('faqs')} icon={HelpCircle}>
+        <TabButton active={tab === 'faqs'} onClick={() => changeTab('faqs')} icon={HelpCircle}>
           Perguntas frequentes
         </TabButton>
         <TabButton
           active={tab === 'custom-fields'}
-          onClick={() => setTab('custom-fields')}
+          onClick={() => changeTab('custom-fields')}
           icon={Settings2}
         >
           Campos personalizados
@@ -69,7 +95,7 @@ export default function ConfiguracoesPage() {
       {tab === 'whatsapp' && <WhatsAppTab />}
       {tab === 'ia' && <AiTab />}
       {tab === 'faqs' && <FaqsTab />}
-      {tab === 'custom-fields' && <CustomFieldsTab />}
+      {tab === 'custom-fields' && <CustomFieldsTab autoOpenNewField={autoOpenNewField} />}
     </div>
   );
 }
@@ -656,10 +682,15 @@ function TemplatesModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function CustomFieldsTab() {
+function CustomFieldsTab({ autoOpenNewField = false }: { autoOpenNewField?: boolean }) {
   const { data: fields = [], isLoading } = useCustomFieldDefinitions('product');
   const deleteField = useDeleteCustomField();
-  const [showForm, setShowForm] = useState(false);
+  const [showForm, setShowForm] = useState(autoOpenNewField);
+
+  // Se o usuário chegou via deep-link ?new=field, abrimos o form e destacamos.
+  useEffect(() => {
+    if (autoOpenNewField) setShowForm(true);
+  }, [autoOpenNewField]);
 
   return (
     <div className="max-w-3xl">
@@ -796,7 +827,6 @@ function CustomFieldForm({ onClose }: { onClose: () => void }) {
   });
 
   const type = watch('type');
-  const label = watch('label');
   const needsOptions = type === 'SELECT' || type === 'MULTISELECT';
 
   const onLabelBlur = (value: string) => {
@@ -820,7 +850,7 @@ function CustomFieldForm({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="card mb-4 p-4">
+    <div className="card mb-4 p-4 ring-2 ring-brand-200">
       <h3 className="mb-3 font-medium">Novo campo personalizado</h3>
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-3" noValidate>
         <ValidatedInput

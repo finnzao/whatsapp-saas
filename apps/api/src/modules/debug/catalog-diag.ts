@@ -61,11 +61,15 @@ export class CatalogDiagService {
   }
 
   async testSearch(tenantId: string, query: string) {
-    const results = await this.catalog.searchProducts(tenantId, { query, limit: 10 });
+    const searchResult = await this.catalog.searchProducts(tenantId, { query, limit: 10 });
     return {
       query,
-      resultsCount: results.length,
-      results,
+      matchQuality: searchResult.matchQuality,
+      queryTokens: searchResult.queryTokens,
+      totalCandidates: searchResult.totalCandidates,
+      resultsCount: searchResult.results.length,
+      hint: searchResult.hint,
+      results: searchResult.results,
     };
   }
 }
