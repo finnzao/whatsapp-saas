@@ -3,6 +3,7 @@ import {
   IsOptional,
   IsBoolean,
   IsInt,
+  IsArray,
   Min,
   MaxLength,
 } from 'class-validator';
@@ -22,6 +23,16 @@ export class CreateCategoryDto {
   @IsString()
   @MaxLength(200)
   description?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Palavras-chave que ativam esta categoria na busca da IA. Aceitas com erros de digitação comuns (ex: "celular", "celulares", "smartphone"). A IA usa pra decidir se o cliente está perguntando sobre esta categoria.',
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  keywords?: string[];
 
   @ApiPropertyOptional()
   @IsOptional()
@@ -49,5 +60,7 @@ export class ImportCategoryTemplateDto {
     type: [String],
   })
   @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
   slugs?: string[];
 }

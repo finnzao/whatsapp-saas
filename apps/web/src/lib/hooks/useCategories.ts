@@ -9,6 +9,7 @@ export interface Category {
   name: string;
   slug: string;
   description?: string | null;
+  keywords: string[];
   order: number;
   active: boolean;
   _count?: { products: number };
@@ -17,6 +18,7 @@ export interface Category {
 export interface CategoryInput {
   name: string;
   description?: string;
+  keywords?: string[];
   order?: number;
   active?: boolean;
 }
@@ -31,6 +33,7 @@ export interface CategoryTemplateGroup {
     name: string;
     slug: string;
     description: string;
+    keywords: string[];
     order: number;
   }>;
 }
@@ -98,7 +101,7 @@ export function useCategoryTemplates() {
       const { data } = await api.get<CategoryTemplateGroup[]>('/categories/templates');
       return data;
     },
-    staleTime: Infinity, // estes nunca mudam em runtime
+    staleTime: Infinity,
   });
 }
 

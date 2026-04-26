@@ -37,46 +37,30 @@ const QUALIFIER_TOKENS = new Set([
   '64gb', '128gb', '256gb', '512gb', '1tb', '2tb',
 ]);
 
-// "Tipo do produto" — SUBSTANTIVOS GENÉRICOS que identificam O QUE é o
-// produto (não a marca/modelo). Defesa contra alucinação tipo "vendi celular
-// como carregador" (token de tipo do cliente NÃO bate em nenhum produto =
-// matchQuality 'none', sem fallback de marca).
+// "Tipo do produto" hardcoded — fallback de defesa quando o tenant ainda
+// não cadastrou keywords nas categorias. Quando o tenant cadastra
+// keywords próprias, essas têm PRIORIDADE sobre esta lista.
 //
 // Cada Set é uma família: cliente diz "celular" e qualquer produto cuja
 // CATEGORIA/HAYSTACK contenha "celular" OU "smartphone" satisfaz.
-//
-// IMPORTANTE: marcas e modelos específicos (iPhone, Galaxy, Xiaomi, Samsung)
-// NÃO entram aqui — vão como tokens 'generic'. Se o cliente disser "iPhone"
-// queremos buscar literalmente "iPhone", não qualquer celular.
 const PRODUCT_TYPE_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
-  // Smartphone (genérico)
   new Set(['celular', 'smartphone', 'aparelho']),
-  // Tablets
   new Set(['tablet']),
-  // Computadores portáteis
   new Set(['notebook', 'laptop', 'ultrabook']),
-  // Computadores fixos
   new Set(['desktop', 'computador', 'pc', 'gabinete']),
-  // Telas
   new Set(['monitor', 'tela']),
   new Set(['tv', 'televisao', 'televisor', 'smarttv']),
-  // Wearables
   new Set(['smartwatch', 'relogio']),
-  // Áudio
   new Set(['fone', 'headphone', 'earphone', 'headset']),
   new Set(['caixinha', 'caixa', 'speaker', 'soundbar']),
-  // Capas e proteção
   new Set(['capa', 'capinha', 'case']),
   new Set(['pelicula', 'protetor']),
-  // Cabos / energia (alvo do bug original)
   new Set(['carregador', 'fonte']),
   new Set(['cabo']),
   new Set(['adaptador']),
   new Set(['powerbank', 'bateria']),
-  // Periféricos
   new Set(['mouse']), new Set(['teclado']), new Set(['webcam']),
   new Set(['microfone']), new Set(['pendrive']), new Set(['hd', 'ssd']),
-  // Moda
   new Set(['camiseta', 'camisa', 'blusa']),
   new Set(['calca', 'short', 'bermuda']),
   new Set(['vestido']), new Set(['saia']),
@@ -84,15 +68,12 @@ const PRODUCT_TYPE_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
   new Set(['tenis', 'sapato', 'sandalia', 'bota', 'chinelo']),
   new Set(['mochila', 'bolsa', 'carteira']),
   new Set(['cinto']), new Set(['oculos']),
-  // Casa
   new Set(['liquidificador']), new Set(['airfryer', 'fritadeira']),
   new Set(['microondas']), new Set(['geladeira']),
   new Set(['fogao']), new Set(['cafeteira']), new Set(['panela']),
   new Set(['sofa']), new Set(['cadeira']), new Set(['mesa']),
-  // Beleza
   new Set(['shampoo']), new Set(['condicionador']), new Set(['creme']),
   new Set(['perfume']), new Set(['batom']), new Set(['rimel']),
-  // Pet
   new Set(['racao']), new Set(['coleira']), new Set(['brinquedo']),
 ];
 
@@ -112,16 +93,10 @@ const GENERIC_TO_MODEL_HINTS: Record<string, string[]> = {
   laptop: ['macbook'],
 };
 
-// Achata todos os tokens em um Set único pra check rápido.
 const PRODUCT_TYPE_TOKENS = new Set<string>(
   PRODUCT_TYPE_GROUPS.flatMap((g) => Array.from(g)),
 );
 
-/**
- * Encontra o "grupo" de sinônimos ao qual um token pertence. Se dois
- * tokens estão no mesmo grupo, eles batem (cliente pode dizer "celular"
- * e o produto ser "iPhone").
- */
 function getProductTypeGroup(token: string): ReadonlySet<string> | null {
   for (const g of PRODUCT_TYPE_GROUPS) {
     if (g.has(token)) return g;
@@ -137,13 +112,12 @@ function getProductTypeGroup(token: string): ReadonlySet<string> | null {
  */
 function simpleStem(token: string): string {
   if (token.length <= 3) return token;
-  // Plurais comuns: -es, -is, -ns
-  if (token.endsWith('oes')) return token.slice(0, -3) + 'ao'; // "carregadoes" raro mas...
+  if (token.endsWith('oes')) return token.slice(0, -3) + 'ao';
   if (token.endsWith('aes')) return token.slice(0, -3) + 'ao';
-  if (token.endsWith('res')) return token.slice(0, -2); // "carregadores" → "carregador"
-  if (token.endsWith('ses')) return token.slice(0, -2); // "meses" → "mese" — ok pro nosso uso
-  if (token.endsWith('ns')) return token.slice(0, -2) + 'm'; // "homens" → "homem"
-  if (token.endsWith('is') && token.length > 4) return token.slice(0, -2) + 'l'; // "papéis" → "papel"
+  if (token.endsWith('res')) return token.slice(0, -2);
+  if (token.endsWith('ses')) return token.slice(0, -2);
+  if (token.endsWith('ns')) return token.slice(0, -2) + 'm';
+  if (token.endsWith('is') && token.length > 4) return token.slice(0, -2) + 'l';
   if (token.endsWith('s') && !token.endsWith('ss')) return token.slice(0, -1);
   return token;
 }
@@ -180,35 +154,34 @@ function tokenize(query: string): string[] {
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter((t) => t.length >= 2 && !STOP_WORDS.has(t))
-    .map(simpleStem); // normaliza plurais ("carregadores" → "carregador")
+    .map(simpleStem);
 }
 
 /**
- * Classifica um token como 'product_type', 'qualifier' ou 'generic'.
- *
- * Tokens 'product_type' são DECISIVOS: se o cliente disse "carregador" e
- * nenhum produto contém essa palavra (nem sinônimo do mesmo grupo),
- * downgrade para matchQuality: 'none'.
+ * Tokeniza uma KEYWORD cadastrada pelo lojista. Pode ser uma frase
+ * ("eau de parfum") ou uma palavra única. Retorna o conjunto de tokens
+ * normalizados que podem aparecer na query do cliente.
  */
-function classifyToken(token: string): 'product_type' | 'qualifier' | 'generic' {
+function tokenizeKeyword(kw: string): string[] {
+  return tokenize(kw);
+}
+
+function classifyToken(
+  token: string,
+  customTypeTokens: Set<string>,
+): 'product_type' | 'qualifier' | 'generic' {
+  // Keywords cadastradas pelo lojista têm prioridade — se ele disse que
+  // "celular" é um tipo da loja dele, é tipo, mesmo que a hardcoded list
+  // discordasse.
+  if (customTypeTokens.has(token)) return 'product_type';
   if (PRODUCT_TYPE_TOKENS.has(token)) return 'product_type';
   if (QUALIFIER_TOKENS.has(token)) return 'qualifier';
   return 'generic';
 }
 
-/**
- * Verifica se um produto cobre um token de tipo do produto, considerando:
- * 1. Sinônimos do MESMO grupo (caixinha = speaker = soundbar)
- * 2. Modelos específicos quando o cliente usou termo genérico
- *    (celular → iphone/galaxy/xiaomi)
- *
- * O reverso NÃO vale: "iphone" não bate "galaxy".
- */
 function productMatchesProductType(haystack: string, productTypeToken: string): boolean {
-  // Bate o próprio token
   if (haystack.includes(productTypeToken)) return true;
 
-  // Bate sinônimos do mesmo grupo (caixinha ↔ speaker)
   const group = getProductTypeGroup(productTypeToken);
   if (group) {
     for (const synonym of group) {
@@ -216,8 +189,6 @@ function productMatchesProductType(haystack: string, productTypeToken: string): 
     }
   }
 
-  // Termo genérico do cliente bate modelos específicos no produto
-  // (celular ↔ iphone/galaxy/etc).
   const modelHints = GENERIC_TO_MODEL_HINTS[productTypeToken];
   if (modelHints) {
     for (const model of modelHints) {
@@ -265,6 +236,25 @@ export function formatBrl(value: number | Prisma.Decimal | string | null | undef
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+/**
+ * Resultado da resolução de keywords contra as categorias do tenant.
+ *
+ * - `customTypeTokens`: conjunto de tokens (já stemmados) que aparecem
+ *   em alguma keyword de categoria. Esses elevam o status do token
+ *   para "product_type" mesmo que não estejam no PRODUCT_TYPE_GROUPS.
+ * - `tokenToCategoryNames`: pra cada token da query que bateu, lista
+ *   as categorias que ele ativa. Usado pra explicar pro cliente o que
+ *   a loja vende quando NADA bate.
+ * - `allCategoryNames`: nomes de todas as categorias ativas, pra
+ *   listar quando o cliente pergunta produto que a loja não tem.
+ */
+interface CategoryKeywordContext {
+  customTypeTokens: Set<string>;
+  tokenToCategoryNames: Map<string, Set<string>>;
+  allCategoryNames: string[];
+  hasAnyKeywords: boolean;
 }
 
 @Injectable()
@@ -330,12 +320,57 @@ export class CatalogTools {
     ];
   }
 
+  /**
+   * Carrega as categorias do tenant e constrói a indexação de keywords.
+   * Chamado uma vez por searchProducts — é o ponto de entrada que dá
+   * prioridade às keywords cadastradas pelo lojista sobre as listas
+   * hardcoded.
+   */
+  private async buildKeywordContext(tenantId: string): Promise<CategoryKeywordContext> {
+    const categories = await this.prisma.category.findMany({
+      where: { tenantId, active: true },
+      select: { name: true, keywords: true },
+    });
+
+    const customTypeTokens = new Set<string>();
+    const tokenToCategoryNames = new Map<string, Set<string>>();
+    const allCategoryNames: string[] = [];
+    let hasAnyKeywords = false;
+
+    for (const cat of categories) {
+      allCategoryNames.push(cat.name);
+      const kws = cat.keywords ?? [];
+      if (kws.length === 0) continue;
+      hasAnyKeywords = true;
+
+      for (const kw of kws) {
+        const tokens = tokenizeKeyword(kw);
+        for (const tok of tokens) {
+          customTypeTokens.add(tok);
+          if (!tokenToCategoryNames.has(tok)) {
+            tokenToCategoryNames.set(tok, new Set());
+          }
+          tokenToCategoryNames.get(tok)!.add(cat.name);
+        }
+      }
+    }
+
+    return {
+      customTypeTokens,
+      tokenToCategoryNames,
+      allCategoryNames,
+      hasAnyKeywords,
+    };
+  }
+
   async searchProducts(
     tenantId: string,
     params: { query: string; maxPrice?: number; minPrice?: number; limit?: number },
   ) {
     const tokens = tokenize(params.query);
     const limit = params.limit ?? 5;
+
+    const keywordCtx = await this.buildKeywordContext(tenantId);
 
     const priceFilter: Prisma.DecimalFilter = {};
     if (params.maxPrice !== undefined) priceFilter.lte = params.maxPrice;
@@ -368,10 +403,10 @@ export class CatalogTools {
       };
     }
 
-    // Classifica cada token. Tokens de TIPO DO PRODUTO ('carregador',
-    // 'pelicula') são decisivos: se a query tem um e nenhum produto bate,
-    // o resultado é 'none' mesmo que outros tokens batam.
-    const tokenTypes = tokens.map((t) => ({ token: t, type: classifyToken(t) }));
+    const tokenTypes = tokens.map((t) => ({
+      token: t,
+      type: classifyToken(t, keywordCtx.customTypeTokens),
+    }));
     const productTypeTokens = tokenTypes
       .filter((t) => t.type === 'product_type')
       .map((t) => t.token);
@@ -379,14 +414,20 @@ export class CatalogTools {
       .filter((t) => t.type === 'qualifier')
       .map((t) => t.token);
 
+    // Categorias ativadas pelos tokens da query (via keywords cadastradas).
+    const activatedCategoryNames = new Set<string>();
+    for (const t of tokens) {
+      const cats = keywordCtx.tokenToCategoryNames.get(t);
+      if (cats) {
+        for (const c of cats) activatedCategoryNames.add(c);
+      }
+    }
+
     const scored = candidates
       .map((p) => {
         const haystack = this.buildHaystack(p);
-        // Match básico (substring) — usado pra qualifiers e tokens genéricos.
         const matchedTokens = tokens.filter((t) => haystack.includes(t));
 
-        // Para PRODUCT_TYPE tokens usamos match POR GRUPO: cliente "celular"
-        // bate produto "iPhone", "smartphone", "galaxy", etc.
         const matchedProductTypes = productTypeTokens.filter((t) =>
           productMatchesProductType(haystack, t),
         );
@@ -395,13 +436,25 @@ export class CatalogTools {
         );
         const missedQualifiers = qualifierTokens.filter((t) => !matchedTokens.includes(t));
 
-        // Considera matchedProductTypes como "encontrados" mesmo quando o
-        // token literal não estava no haystack (mas um sinônimo estava).
+        // Boost: se o produto está numa categoria que foi ativada pelas
+        // keywords da query, é forte sinal de match — mesmo que o nome
+        // do produto não tenha o token literal.
+        const productCategoryName = p.category?.name;
+        const categoryActivated =
+          productCategoryName !== undefined &&
+          activatedCategoryNames.has(productCategoryName);
+
         const effectiveMatched = Array.from(
           new Set([...matchedTokens, ...matchedProductTypes]),
         );
 
-        const score = this.computeScore(p, tokens, effectiveMatched, matchedProductTypes);
+        const score = this.computeScore(
+          p,
+          tokens,
+          effectiveMatched,
+          matchedProductTypes,
+          categoryActivated,
+        );
 
         return {
           product: p,
@@ -409,28 +462,38 @@ export class CatalogTools {
           matchedTokens: effectiveMatched,
           missedProductTypes,
           missedQualifiers,
+          categoryActivated,
         };
       })
-      .filter((x) => x.matchedTokens.length > 0)
+      // Mantemos produtos sem match direto MAS com categoria ativada —
+      // é o caso "cliente disse 'iphone', produto se chama 'Apple 13'
+      // mas está na categoria Smartphones que tem 'iphone' como keyword".
+      .filter((x) => x.matchedTokens.length > 0 || x.categoryActivated)
       .sort((a, b) => b.score - a.score);
 
-    // Determinação de matchQuality:
-    // - Se a query tem tokens de TIPO DO PRODUTO, eles DEVEM bater. Se não
-    //   batem, downgrade automático para 'none' (mesmo que outros tokens
-    //   batam). Isto previne o cenário "perguntou carregador, vendeu celular".
-    // - Se todos os tokens batem (incluindo qualificadores) → 'exact'.
-    // - Se TYPE bate mas qualificador não → 'partial' (oferecer alternativa
-    //   é razoável: "não tem azul, mas tem preto").
     let matchQuality: 'exact' | 'partial' | 'none';
     let chosen: typeof scored;
 
     const hasProductTypeRequirement = productTypeTokens.length > 0;
-    const productsWithRequiredType = scored.filter((x) => x.missedProductTypes.length === 0);
+
+    // Um produto satisfaz o tipo se: (1) o haystack bate nos sinônimos,
+    // OU (2) está numa categoria ativada por keyword cadastrada que
+    // contém o token de tipo. (2) é a parte nova — keywords do lojista
+    // resolvem casos que a hardcoded list não cobre.
+    const productsWithRequiredType = scored.filter((x) => {
+      if (x.missedProductTypes.length === 0) return true;
+      if (!x.categoryActivated) return false;
+      const productCatName = x.product.category?.name;
+      if (!productCatName) return false;
+      // Para cada tipo "perdido" no haystack, verifica se a categoria
+      // do produto foi ativada por uma keyword que inclui esse token.
+      return x.missedProductTypes.every((missedType) => {
+        const catsThatHaveToken = keywordCtx.tokenToCategoryNames.get(missedType);
+        return catsThatHaveToken?.has(productCatName) ?? false;
+      });
+    });
 
     if (hasProductTypeRequirement && productsWithRequiredType.length === 0) {
-      // Cliente pediu "carregador" e NENHUM produto contém "carregador":
-      // mesmo que tenhamos Galaxy S24 que bate "samsung", isso NÃO é
-      // alternativa válida — é categoria errada.
       matchQuality = 'none';
       chosen = [];
     } else {
@@ -454,6 +517,7 @@ export class CatalogTools {
     this.logger.debug(
       `[search_products] query="${params.query}" tokens=[${tokens.join(', ')}] ` +
         `productType=[${productTypeTokens.join(', ')}] qualifiers=[${qualifierTokens.join(', ')}] ` +
+        `activatedCategories=[${Array.from(activatedCategoryNames).join(', ')}] ` +
         `candidates=${candidates.length} scored=${scored.length} ` +
         `matchQuality=${matchQuality} returned=${chosen.length}`,
     );
@@ -465,7 +529,7 @@ export class CatalogTools {
       results: chosen.map((x) => ({
         ...this.serializeProduct(x.product),
         matchedOn: x.matchedTokens,
-        notMatched: x.missedQualifiers, // só qualificadores aqui — types já foram filtrados acima
+        notMatched: x.missedQualifiers,
       })),
       ...(matchQuality === 'partial' && {
         hint:
@@ -475,10 +539,7 @@ export class CatalogTools {
       }),
       ...(matchQuality === 'none' &&
         hasProductTypeRequirement && {
-          hint:
-            `O cliente pediu produto do tipo "${productTypeTokens.join(', ')}" e a loja NÃO TEM esse tipo. ` +
-            'NÃO ofereça produtos de tipo diferente. Diga honestamente que não tem e pergunte se o cliente ' +
-            'aceita outro tipo de produto ou se quer ser atendido por humano.',
+          hint: this.buildNoneHint(keywordCtx, productTypeTokens),
         }),
       ...(matchQuality === 'none' &&
         !hasProductTypeRequirement && {
@@ -487,6 +548,28 @@ export class CatalogTools {
             'ou ofereça transferência para atendente.',
         }),
     };
+  }
+
+  /**
+   * Quando matchQuality='none' E o cliente pediu um tipo de produto,
+   * monta um hint que lista as categorias REAIS da loja. Assim a IA não
+   * inventa "temos isso" quando não tem, e dá uma resposta útil
+   * ("não temos X, mas temos Y, Z").
+   */
+  private buildNoneHint(ctx: CategoryKeywordContext, productTypeTokens: string[]): string {
+    const requested = productTypeTokens.join(', ');
+    const sells =
+      ctx.allCategoryNames.length > 0
+        ? `Esta loja vende: ${ctx.allCategoryNames.join(', ')}.`
+        : 'Esta loja ainda não tem categorias cadastradas.';
+
+    return (
+      `O cliente pediu produto do tipo "${requested}" e a loja NÃO TEM esse tipo. ` +
+      `${sells} ` +
+      'NÃO ofereça produtos de tipo diferente como se fossem o que o cliente pediu. ' +
+      'Diga honestamente que não tem e, se fizer sentido, mencione o que a loja vende. ' +
+      'Se o cliente insistir ou ficar irritado, ofereça transferência para atendente humano.'
+    );
   }
 
   private buildHaystack(p: ProductWithRelations): string {
@@ -525,23 +608,23 @@ export class CatalogTools {
 
   /**
    * Score: matches em PRODUCT_TYPE valem MUITO mais que matches em qualifier
-   * ou genérico. Garante que "carregador samsung" priorize um carregador
-   * (mesmo de outra marca) sobre um Galaxy (mesmo da Samsung).
+   * ou genérico. Categoria ativada por keyword soma um boost menor — não
+   * domina sobre match de nome, mas resolve o caso de produto cadastrado
+   * sem o termo genérico no nome.
    */
   private computeScore(
     p: ProductWithRelations,
     tokens: string[],
     matched: string[],
     matchedProductTypes: string[],
+    categoryActivated: boolean,
   ): number {
     const nameNorm = normalize(p.name);
     const nameMatches = tokens.filter((t) => nameNorm.includes(t)).length;
 
     let score = matched.length * 10 + nameMatches * 20;
-
-    // Boost forte para matches em product_type — distingue "carregador"
-    // (que é o que o cliente quer) de "samsung" (incidental).
     score += matchedProductTypes.length * 50;
+    if (categoryActivated) score += 25;
 
     if (p.stock > 0) score += 5;
     if (tokens.every((t) => nameNorm.includes(t))) score += 30;

@@ -143,7 +143,6 @@ export const productSchema = z
     customFields: z.record(z.unknown()).optional(),
   })
   .superRefine((data, ctx) => {
-    // Parcelamento só faz sentido com os dois campos juntos.
     const hasInstallments =
       data.installments !== null && data.installments !== undefined && data.installments > 0;
     const hasInstallmentPrice =
@@ -166,9 +165,6 @@ export const productSchema = z
       });
     }
 
-    // Se tem parcelamento mas o valor parcelado é menor que o preço base,
-    // provavelmente é engano do usuário (parcelamento normalmente é > à vista).
-    // Warning leve: só avisa, não bloqueia.
     if (
       hasInstallmentPrice &&
       data.priceInstallment! < data.price &&
@@ -204,6 +200,10 @@ export const customFieldDefinitionSchema = z.object({
 export const categorySchema = z.object({
   name: fields.name(2, 80),
   description: z.string().max(200).optional().or(z.literal('')),
+  // Keywords são opcionais — categoria pode ser criada sem elas e
+  // adicionar depois. Limite pequeno por palavra evita usuário colar
+  // frases longas que viram ruído na busca.
+  keywords: z.array(z.string().trim().min(1).max(40)).max(50).optional(),
   order: z.number().int().min(0).optional(),
   active: z.boolean().optional(),
 });

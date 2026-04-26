@@ -49,6 +49,7 @@ export class CategoriesService {
         name: dto.name,
         slug,
         description: dto.description ?? null,
+        keywords: this.cleanKeywords(dto.keywords ?? []),
         order: dto.order ?? 0,
         active: dto.active ?? true,
       },
@@ -64,6 +65,7 @@ export class CategoriesService {
         slug: await this.ensureUniqueSlug(tenantId, this.slugify(dto.name), id),
       }),
       ...(dto.description !== undefined && { description: dto.description || null }),
+      ...(dto.keywords !== undefined && { keywords: this.cleanKeywords(dto.keywords) }),
       ...(dto.order !== undefined && { order: dto.order }),
       ...(dto.active !== undefined && { active: dto.active }),
     };
@@ -143,6 +145,7 @@ export class CategoriesService {
         name: c.name,
         slug: c.slug,
         description: c.description,
+        keywords: this.cleanKeywords(c.keywords),
         order: maxOrder + i + 1,
         active: true,
       })),
@@ -152,6 +155,33 @@ export class CategoriesService {
       imported: newOnes.length,
       skipped: toImport.length - newOnes.length,
     };
+  }
+
+  /**
+   * Normaliza as keywords igual o FAQ faz: trim, lowercase, deduplica
+   * por forma normalizada (sem acento), descarta vazios.
+   *
+   * Mantém a forma ORIGINAL no array (com acentos) pra ficar bonito no
+   * UI. A normalização sem acento serve só pra deduplicar — se o usuário
+   * digitar "celular" e depois "Celulares" eles continuam separados,
+   * mas "celular" e "celular " viram um só.
+   */
+  private cleanKeywords(keywords: string[]): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const kw of keywords) {
+      if (typeof kw !== 'string') continue;
+      const trimmed = kw.trim();
+      if (!trimmed) continue;
+      const fingerprint = trimmed
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+      if (seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
+      result.push(trimmed.toLowerCase());
+    }
+    return result;
   }
 
   private slugify(input: string): string {
