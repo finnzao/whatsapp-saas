@@ -36,3 +36,18 @@ export class CreateCategoryDto {
 }
 
 export class UpdateCategoryDto extends PartialType(CreateCategoryDto) {}
+
+export class ImportCategoryTemplateDto {
+  @ApiProperty({
+    description: 'ID do pacote de categorias (ex: "eletronicos", "moda")',
+  })
+  @IsString()
+  groupId!: string;
+
+  @ApiPropertyOptional({
+    description: 'Slugs específicos dentro do pacote. Se omitido, importa todos.',
+    type: [String],
+  })
+  @IsOptional()
+  slugs?: string[];
+}

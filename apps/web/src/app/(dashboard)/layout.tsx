@@ -11,6 +11,7 @@ import {
   Users,
   ShoppingBag,
   Database,
+  FolderTree,
 } from 'lucide-react';
 import { AuthGuard } from '@/components/auth/AuthGuard';
 import { useCurrentUser, useLogout } from '@/lib/hooks/useAuth';
@@ -21,6 +22,7 @@ const isDev = process.env.NODE_ENV !== 'production';
 const navItems = [
   { href: '/conversas', label: 'Conversas', icon: MessageSquare },
   { href: '/contatos', label: 'Contatos', icon: Users },
+  { href: '/categorias', label: 'Categorias', icon: FolderTree },
   { href: '/catalogo', label: 'Catálogo', icon: Package },
   { href: '/pedidos', label: 'Pedidos', icon: ShoppingBag },
   { href: '/configuracoes', label: 'Configurações', icon: Settings },

@@ -6,15 +6,18 @@ import {
   Delete,
   Body,
   Param,
+  Query,
   UseGuards,
+  HttpCode,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 
+import { CategoriesService } from './categories.service';
 import {
-  CategoriesService,
   CreateCategoryDto,
   UpdateCategoryDto,
-} from './categories.service';
+  ImportCategoryTemplateDto,
+} from './dto/category.dto';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { CurrentTenant } from '../../../common/decorators/current-tenant.decorator';
 
@@ -26,8 +29,24 @@ export class CategoriesController {
   constructor(private readonly service: CategoriesService) {}
 
   @Get()
-  list(@CurrentTenant() tenantId: string) {
-    return this.service.list(tenantId);
+  list(@CurrentTenant() tenantId: string, @Query('onlyActive') onlyActive?: string) {
+    return this.service.list(tenantId, onlyActive === 'true');
+  }
+
+  // Endpoints de templates DEVEM vir antes de :id para não conflitar
+  // com o roteamento dinâmico do Nest.
+  @Get('templates')
+  listTemplates() {
+    return this.service.listTemplates();
+  }
+
+  @Post('import-template')
+  @HttpCode(200)
+  importTemplate(
+    @CurrentTenant() tenantId: string,
+    @Body() dto: ImportCategoryTemplateDto,
+  ) {
+    return this.service.importTemplate(tenantId, dto);
   }
 
   @Get(':id')

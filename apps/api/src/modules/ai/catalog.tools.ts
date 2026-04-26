@@ -17,18 +17,6 @@ export type ToolExecutionResult =
   | { handoff?: false; [key: string]: unknown }
   | unknown[];
 
-/**
- * Representa um preço com todas as formas já pré-computadas para
- * evitar que o modelo cometa erro de formatação/conversão.
- * O modelo só precisa copiar `display` literalmente.
- */
-export interface GroundedPriceInfo {
-  display: string;      // "R$ 14,14"
-  displayCash?: string; // "R$ 14,00" (se houver desconto)
-  installmentsDisplay?: string; // "1x de R$ 14,14" (se houver parcelamento)
-  valueBrl: number;     // 14.14 — pra cálculos internos, não pra exibir
-}
-
 const STOP_WORDS = new Set([
   'a', 'o', 'as', 'os', 'um', 'uma', 'uns', 'umas',
   'de', 'do', 'da', 'dos', 'das', 'em', 'no', 'na', 'nos', 'nas',
@@ -38,11 +26,127 @@ const STOP_WORDS = new Set([
   'favor', 'obrigado', 'obrigada',
 ]);
 
-const DISCRIMINATIVE_TOKENS = new Set([
+// "Qualificadores" — adjetivos que descrevem variações do mesmo produto.
+// Cor, tamanho, voltagem. Quando o cliente pede "azul" e só tem "preto",
+// é razoável oferecer alternativa.
+const QUALIFIER_TOKENS = new Set([
   'preto', 'branco', 'azul', 'vermelho', 'verde', 'amarelo', 'rosa', 'roxo',
   'cinza', 'prata', 'dourado', 'laranja', 'marrom', 'bege', 'lilas', 'violeta',
   'pp', 'p', 'm', 'g', 'gg', 'xgg',
+  '110v', '220v', 'bivolt',
+  '64gb', '128gb', '256gb', '512gb', '1tb', '2tb',
 ]);
+
+// "Tipo do produto" — SUBSTANTIVOS GENÉRICOS que identificam O QUE é o
+// produto (não a marca/modelo). Defesa contra alucinação tipo "vendi celular
+// como carregador" (token de tipo do cliente NÃO bate em nenhum produto =
+// matchQuality 'none', sem fallback de marca).
+//
+// Cada Set é uma família: cliente diz "celular" e qualquer produto cuja
+// CATEGORIA/HAYSTACK contenha "celular" OU "smartphone" satisfaz.
+//
+// IMPORTANTE: marcas e modelos específicos (iPhone, Galaxy, Xiaomi, Samsung)
+// NÃO entram aqui — vão como tokens 'generic'. Se o cliente disser "iPhone"
+// queremos buscar literalmente "iPhone", não qualquer celular.
+const PRODUCT_TYPE_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
+  // Smartphone (genérico)
+  new Set(['celular', 'smartphone', 'aparelho']),
+  // Tablets
+  new Set(['tablet']),
+  // Computadores portáteis
+  new Set(['notebook', 'laptop', 'ultrabook']),
+  // Computadores fixos
+  new Set(['desktop', 'computador', 'pc', 'gabinete']),
+  // Telas
+  new Set(['monitor', 'tela']),
+  new Set(['tv', 'televisao', 'televisor', 'smarttv']),
+  // Wearables
+  new Set(['smartwatch', 'relogio']),
+  // Áudio
+  new Set(['fone', 'headphone', 'earphone', 'headset']),
+  new Set(['caixinha', 'caixa', 'speaker', 'soundbar']),
+  // Capas e proteção
+  new Set(['capa', 'capinha', 'case']),
+  new Set(['pelicula', 'protetor']),
+  // Cabos / energia (alvo do bug original)
+  new Set(['carregador', 'fonte']),
+  new Set(['cabo']),
+  new Set(['adaptador']),
+  new Set(['powerbank', 'bateria']),
+  // Periféricos
+  new Set(['mouse']), new Set(['teclado']), new Set(['webcam']),
+  new Set(['microfone']), new Set(['pendrive']), new Set(['hd', 'ssd']),
+  // Moda
+  new Set(['camiseta', 'camisa', 'blusa']),
+  new Set(['calca', 'short', 'bermuda']),
+  new Set(['vestido']), new Set(['saia']),
+  new Set(['jaqueta', 'casaco', 'moletom']),
+  new Set(['tenis', 'sapato', 'sandalia', 'bota', 'chinelo']),
+  new Set(['mochila', 'bolsa', 'carteira']),
+  new Set(['cinto']), new Set(['oculos']),
+  // Casa
+  new Set(['liquidificador']), new Set(['airfryer', 'fritadeira']),
+  new Set(['microondas']), new Set(['geladeira']),
+  new Set(['fogao']), new Set(['cafeteira']), new Set(['panela']),
+  new Set(['sofa']), new Set(['cadeira']), new Set(['mesa']),
+  // Beleza
+  new Set(['shampoo']), new Set(['condicionador']), new Set(['creme']),
+  new Set(['perfume']), new Set(['batom']), new Set(['rimel']),
+  // Pet
+  new Set(['racao']), new Set(['coleira']), new Set(['brinquedo']),
+];
+
+// Sinônimos que conectam termo GENÉRICO a MODELO específico no haystack.
+// Quando o cliente diz "celular", buscamos no produto também "iphone",
+// "galaxy", "xiaomi" etc. — porque um catálogo real tem Samsung Galaxy
+// cadastrado sem a palavra "celular".
+//
+// Mas o INVERSO não vale: cliente que diz "iphone" NÃO quer ver "galaxy".
+// Por isso este mapping é unidirecional (genérico → modelos).
+const GENERIC_TO_MODEL_HINTS: Record<string, string[]> = {
+  celular: ['iphone', 'galaxy', 'xiaomi', 'redmi', 'motorola', 'moto'],
+  smartphone: ['iphone', 'galaxy', 'xiaomi', 'redmi', 'motorola', 'moto'],
+  aparelho: ['iphone', 'galaxy', 'xiaomi', 'redmi', 'motorola', 'moto'],
+  tablet: ['ipad'],
+  notebook: ['macbook'],
+  laptop: ['macbook'],
+};
+
+// Achata todos os tokens em um Set único pra check rápido.
+const PRODUCT_TYPE_TOKENS = new Set<string>(
+  PRODUCT_TYPE_GROUPS.flatMap((g) => Array.from(g)),
+);
+
+/**
+ * Encontra o "grupo" de sinônimos ao qual um token pertence. Se dois
+ * tokens estão no mesmo grupo, eles batem (cliente pode dizer "celular"
+ * e o produto ser "iPhone").
+ */
+function getProductTypeGroup(token: string): ReadonlySet<string> | null {
+  for (const g of PRODUCT_TYPE_GROUPS) {
+    if (g.has(token)) return g;
+  }
+  return null;
+}
+
+/**
+ * Stem simples para português. Cobre os casos mais comuns que aparecem
+ * em chat: plural ("carregadores" → "carregador"), aumentativo simples,
+ * variações de gênero. Não é um stemmer completo (Porter PT), só o
+ * suficiente pra evitar miss óbvios.
+ */
+function simpleStem(token: string): string {
+  if (token.length <= 3) return token;
+  // Plurais comuns: -es, -is, -ns
+  if (token.endsWith('oes')) return token.slice(0, -3) + 'ao'; // "carregadoes" raro mas...
+  if (token.endsWith('aes')) return token.slice(0, -3) + 'ao';
+  if (token.endsWith('res')) return token.slice(0, -2); // "carregadores" → "carregador"
+  if (token.endsWith('ses')) return token.slice(0, -2); // "meses" → "mese" — ok pro nosso uso
+  if (token.endsWith('ns')) return token.slice(0, -2) + 'm'; // "homens" → "homem"
+  if (token.endsWith('is') && token.length > 4) return token.slice(0, -2) + 'l'; // "papéis" → "papel"
+  if (token.endsWith('s') && !token.endsWith('ss')) return token.slice(0, -1);
+  return token;
+}
 
 const HEX_TO_COLOR_NAME: Array<{ hex: string; name: string }> = [
   { hex: '#000000', name: 'preto' },
@@ -75,7 +179,53 @@ function tokenize(query: string): string[] {
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter((t) => t.length >= 2 && !STOP_WORDS.has(t));
+    .filter((t) => t.length >= 2 && !STOP_WORDS.has(t))
+    .map(simpleStem); // normaliza plurais ("carregadores" → "carregador")
+}
+
+/**
+ * Classifica um token como 'product_type', 'qualifier' ou 'generic'.
+ *
+ * Tokens 'product_type' são DECISIVOS: se o cliente disse "carregador" e
+ * nenhum produto contém essa palavra (nem sinônimo do mesmo grupo),
+ * downgrade para matchQuality: 'none'.
+ */
+function classifyToken(token: string): 'product_type' | 'qualifier' | 'generic' {
+  if (PRODUCT_TYPE_TOKENS.has(token)) return 'product_type';
+  if (QUALIFIER_TOKENS.has(token)) return 'qualifier';
+  return 'generic';
+}
+
+/**
+ * Verifica se um produto cobre um token de tipo do produto, considerando:
+ * 1. Sinônimos do MESMO grupo (caixinha = speaker = soundbar)
+ * 2. Modelos específicos quando o cliente usou termo genérico
+ *    (celular → iphone/galaxy/xiaomi)
+ *
+ * O reverso NÃO vale: "iphone" não bate "galaxy".
+ */
+function productMatchesProductType(haystack: string, productTypeToken: string): boolean {
+  // Bate o próprio token
+  if (haystack.includes(productTypeToken)) return true;
+
+  // Bate sinônimos do mesmo grupo (caixinha ↔ speaker)
+  const group = getProductTypeGroup(productTypeToken);
+  if (group) {
+    for (const synonym of group) {
+      if (synonym !== productTypeToken && haystack.includes(synonym)) return true;
+    }
+  }
+
+  // Termo genérico do cliente bate modelos específicos no produto
+  // (celular ↔ iphone/galaxy/etc).
+  const modelHints = GENERIC_TO_MODEL_HINTS[productTypeToken];
+  if (modelHints) {
+    for (const model of modelHints) {
+      if (haystack.includes(model)) return true;
+    }
+  }
+
+  return false;
 }
 
 function hexDistance(a: string, b: string): number {
@@ -128,14 +278,14 @@ export class CatalogTools {
       {
         name: 'search_products',
         description:
-          'USE SEMPRE QUE O CLIENTE PERGUNTAR SOBRE PRODUTOS. Busca no catálogo por nome, marca, modelo, categoria, cor, tamanho, voltagem ou qualquer característica. Aceita texto livre com várias palavras. Retorna produtos com matchQuality ("exact" ou "partial") e priceDisplay já FORMATADO em reais — sempre use o priceDisplay literal ao responder, NUNCA recalcule.',
+          'USE SEMPRE QUE O CLIENTE PERGUNTAR SOBRE PRODUTOS. Busca no catálogo. Retorna matchQuality ("exact"/"partial"/"none") e priceDisplay já FORMATADO em reais — sempre use o priceDisplay literal ao responder, NUNCA recalcule.',
         parameters: {
           type: 'object' as const,
           properties: {
             query: {
               type: 'string',
               description:
-                'Texto de busca livre com as palavras do cliente. Pode e deve conter características (cor, tamanho, marca) junto com o nome.',
+                'Texto livre com as palavras do cliente, incluindo características (cor, tamanho, marca).',
             },
             maxPrice: { type: 'number', description: 'Preço máximo em reais (opcional)' },
             minPrice: { type: 'number', description: 'Preço mínimo em reais (opcional)' },
@@ -147,14 +297,13 @@ export class CatalogTools {
       {
         name: 'check_product_availability',
         description:
-          'NÃO use esta ferramenta para perguntas iniciais do cliente. Use APENAS depois de search_products, para checar se um produto específico que você já encontrou ainda tem estoque. O productId DEVE ser um UUID válido retornado por search_products em uma chamada anterior desta conversa. NUNCA invente productId, NUNCA passe o nome do produto como productId.',
+          'NÃO use para perguntas iniciais. Use APENAS depois de search_products, com um UUID retornado por ele. NUNCA invente productId.',
         parameters: {
           type: 'object' as const,
           properties: {
             productId: {
               type: 'string',
-              description:
-                'UUID do produto (ex: 550e8400-e29b-41d4-a716-446655440000). SÓ use IDs retornados antes por search_products.',
+              description: 'UUID retornado antes por search_products.',
             },
           },
           required: ['productId'],
@@ -163,13 +312,13 @@ export class CatalogTools {
       {
         name: 'list_categories',
         description:
-          'Lista as categorias de produtos da loja. Use quando o cliente perguntar "quais categorias vocês têm?" ou "o que vocês vendem?" de forma genérica.',
+          'Lista categorias da loja. Use quando o cliente perguntar genericamente o que vocês vendem.',
         parameters: { type: 'object' as const, properties: {} },
       },
       {
         name: 'request_human_handoff',
         description:
-          'Transfere a conversa para um atendente humano. Use quando o cliente pedir explicitamente, estiver muito irritado, ou em casos complexos (reclamação de pedido, problema técnico grave, negociação de desconto).',
+          'Transfere para humano. Use quando o cliente pedir explicitamente, estiver irritado, reclamar de pedido, pedir desconto ou assistência técnica.',
         parameters: {
           type: 'object' as const,
           properties: {
@@ -219,45 +368,92 @@ export class CatalogTools {
       };
     }
 
-    const discriminativeTokens = tokens.filter((t) => DISCRIMINATIVE_TOKENS.has(t));
+    // Classifica cada token. Tokens de TIPO DO PRODUTO ('carregador',
+    // 'pelicula') são decisivos: se a query tem um e nenhum produto bate,
+    // o resultado é 'none' mesmo que outros tokens batam.
+    const tokenTypes = tokens.map((t) => ({ token: t, type: classifyToken(t) }));
+    const productTypeTokens = tokenTypes
+      .filter((t) => t.type === 'product_type')
+      .map((t) => t.token);
+    const qualifierTokens = tokenTypes
+      .filter((t) => t.type === 'qualifier')
+      .map((t) => t.token);
 
     const scored = candidates
       .map((p) => {
         const haystack = this.buildHaystack(p);
+        // Match básico (substring) — usado pra qualifiers e tokens genéricos.
         const matchedTokens = tokens.filter((t) => haystack.includes(t));
-        const missedDiscriminative = discriminativeTokens.filter(
-          (t) => !matchedTokens.includes(t),
+
+        // Para PRODUCT_TYPE tokens usamos match POR GRUPO: cliente "celular"
+        // bate produto "iPhone", "smartphone", "galaxy", etc.
+        const matchedProductTypes = productTypeTokens.filter((t) =>
+          productMatchesProductType(haystack, t),
         );
-        const score = this.computeScore(p, tokens, matchedTokens);
+        const missedProductTypes = productTypeTokens.filter(
+          (t) => !productMatchesProductType(haystack, t),
+        );
+        const missedQualifiers = qualifierTokens.filter((t) => !matchedTokens.includes(t));
+
+        // Considera matchedProductTypes como "encontrados" mesmo quando o
+        // token literal não estava no haystack (mas um sinônimo estava).
+        const effectiveMatched = Array.from(
+          new Set([...matchedTokens, ...matchedProductTypes]),
+        );
+
+        const score = this.computeScore(p, tokens, effectiveMatched, matchedProductTypes);
+
         return {
           product: p,
           score,
-          matchedTokens,
-          missedDiscriminative,
+          matchedTokens: effectiveMatched,
+          missedProductTypes,
+          missedQualifiers,
         };
       })
       .filter((x) => x.matchedTokens.length > 0)
       .sort((a, b) => b.score - a.score);
 
-    const exactMatches = scored.filter((x) => x.matchedTokens.length === tokens.length);
-
+    // Determinação de matchQuality:
+    // - Se a query tem tokens de TIPO DO PRODUTO, eles DEVEM bater. Se não
+    //   batem, downgrade automático para 'none' (mesmo que outros tokens
+    //   batam). Isto previne o cenário "perguntou carregador, vendeu celular".
+    // - Se todos os tokens batem (incluindo qualificadores) → 'exact'.
+    // - Se TYPE bate mas qualificador não → 'partial' (oferecer alternativa
+    //   é razoável: "não tem azul, mas tem preto").
     let matchQuality: 'exact' | 'partial' | 'none';
     let chosen: typeof scored;
 
-    if (exactMatches.length > 0) {
-      matchQuality = 'exact';
-      chosen = exactMatches.slice(0, limit);
-    } else if (scored.length > 0) {
-      matchQuality = 'partial';
-      chosen = scored.slice(0, limit);
-    } else {
+    const hasProductTypeRequirement = productTypeTokens.length > 0;
+    const productsWithRequiredType = scored.filter((x) => x.missedProductTypes.length === 0);
+
+    if (hasProductTypeRequirement && productsWithRequiredType.length === 0) {
+      // Cliente pediu "carregador" e NENHUM produto contém "carregador":
+      // mesmo que tenhamos Galaxy S24 que bate "samsung", isso NÃO é
+      // alternativa válida — é categoria errada.
       matchQuality = 'none';
       chosen = [];
+    } else {
+      const candidatesForChoice = hasProductTypeRequirement ? productsWithRequiredType : scored;
+      const exactMatches = candidatesForChoice.filter(
+        (x) => x.matchedTokens.length === tokens.length,
+      );
+
+      if (exactMatches.length > 0) {
+        matchQuality = 'exact';
+        chosen = exactMatches.slice(0, limit);
+      } else if (candidatesForChoice.length > 0) {
+        matchQuality = 'partial';
+        chosen = candidatesForChoice.slice(0, limit);
+      } else {
+        matchQuality = 'none';
+        chosen = [];
+      }
     }
 
     this.logger.debug(
       `[search_products] query="${params.query}" tokens=[${tokens.join(', ')}] ` +
-        `discriminative=[${discriminativeTokens.join(', ')}] ` +
+        `productType=[${productTypeTokens.join(', ')}] qualifiers=[${qualifierTokens.join(', ')}] ` +
         `candidates=${candidates.length} scored=${scored.length} ` +
         `matchQuality=${matchQuality} returned=${chosen.length}`,
     );
@@ -269,20 +465,27 @@ export class CatalogTools {
       results: chosen.map((x) => ({
         ...this.serializeProduct(x.product),
         matchedOn: x.matchedTokens,
-        notMatched: x.missedDiscriminative,
+        notMatched: x.missedQualifiers, // só qualificadores aqui — types já foram filtrados acima
       })),
       ...(matchQuality === 'partial' && {
         hint:
-          'IMPORTANTE: Estes produtos são PARECIDOS mas NÃO SÃO EXATAMENTE o que o cliente pediu. ' +
-          'Examine "notMatched" de cada resultado. Diga honestamente ao cliente que não tem o item específico pedido ' +
-          'e mostre o que você tem como alternativa. NÃO finja que é o produto pedido. ' +
-          'Use priceDisplay LITERAL do resultado.',
+          'IMPORTANTE: Estes produtos são do tipo certo mas têm DIFERENÇAS do que o cliente pediu ' +
+          '(veja "notMatched" de cada). Avise honestamente sobre a diferença antes de oferecer. ' +
+          'Use priceDisplay LITERAL.',
       }),
-      ...(matchQuality === 'none' && {
-        hint:
-          'Nenhum produto encontrado. Diga honestamente que não tem, e pergunte se o cliente aceita ' +
-          'alternativas parecidas ou se pode detalhar mais (marca, modelo, faixa de preço).',
-      }),
+      ...(matchQuality === 'none' &&
+        hasProductTypeRequirement && {
+          hint:
+            `O cliente pediu produto do tipo "${productTypeTokens.join(', ')}" e a loja NÃO TEM esse tipo. ` +
+            'NÃO ofereça produtos de tipo diferente. Diga honestamente que não tem e pergunte se o cliente ' +
+            'aceita outro tipo de produto ou se quer ser atendido por humano.',
+        }),
+      ...(matchQuality === 'none' &&
+        !hasProductTypeRequirement && {
+          hint:
+            'Nenhum produto encontrado. Peça mais detalhes (marca, modelo, faixa de preço) ' +
+            'ou ofereça transferência para atendente.',
+        }),
     };
   }
 
@@ -320,15 +523,25 @@ export class CatalogTools {
     return s;
   }
 
+  /**
+   * Score: matches em PRODUCT_TYPE valem MUITO mais que matches em qualifier
+   * ou genérico. Garante que "carregador samsung" priorize um carregador
+   * (mesmo de outra marca) sobre um Galaxy (mesmo da Samsung).
+   */
   private computeScore(
     p: ProductWithRelations,
     tokens: string[],
     matched: string[],
+    matchedProductTypes: string[],
   ): number {
     const nameNorm = normalize(p.name);
     const nameMatches = tokens.filter((t) => nameNorm.includes(t)).length;
 
     let score = matched.length * 10 + nameMatches * 20;
+
+    // Boost forte para matches em product_type — distingue "carregador"
+    // (que é o que o cliente quer) de "samsung" (incidental).
+    score += matchedProductTypes.length * 50;
 
     if (p.stock > 0) score += 5;
     if (tokens.every((t) => nameNorm.includes(t))) score += 30;
@@ -336,13 +549,6 @@ export class CatalogTools {
     return score;
   }
 
-  /**
-   * Pré-formata preços como strings brasileiras.
-   * Esta é a defesa principal contra alucinação de valor: o modelo copia
-   * `priceDisplay` em vez de formatar o número `price`. Também pré-computa
-   * `fullPriceText` que contém uma string "humana" já pronta, reduzindo ainda
-   * mais a chance do modelo mexer em dígitos.
-   */
   private buildPriceInfo(p: ProductWithRelations): {
     priceDisplay: string;
     priceCashDisplay: string | null;
@@ -361,9 +567,6 @@ export class CatalogTools {
       }
     }
 
-    // Texto completo pronto pra o modelo copiar quase literal.
-    // Ex: "R$ 14,14 (ou R$ 14,00 à vista, ou 1x de R$ 14,14)"
-    const parts: string[] = [priceDisplay];
     const extras: string[] = [];
     if (priceCashDisplay && priceCashDisplay !== priceDisplay) {
       extras.push(`${priceCashDisplay} à vista`);
@@ -385,15 +588,10 @@ export class CatalogTools {
     const enrichedCf = cf ? this.enrichCustomFieldsForDisplay(cf) : null;
     const priceInfo = this.buildPriceInfo(p);
 
-    // IMPORTANTE: mantemos os campos numéricos crus (`price`, `stock`) porque
-    // o frontend `/dev` os usa pra exibir. Eles ficam no payload que o modelo
-    // também vê, mas o prompt deixa claro que SÓ `priceDisplay`/`fullPriceText`
-    // devem ser citados — e o PriceGuardrailService valida pós-resposta.
     return {
       id: p.id,
       name: p.name,
       description: p.description,
-      // Campos formatados — ESTES SÃO OS QUE O MODELO DEVE CITAR.
       priceDisplay: priceInfo.priceDisplay,
       priceCashDisplay: priceInfo.priceCashDisplay,
       installmentsDisplay: priceInfo.installmentsDisplay,
@@ -403,7 +601,6 @@ export class CatalogTools {
           ? `${p.stock} em estoque`
           : 'sem estoque'
         : 'disponível',
-      // Campos numéricos crus para compatibilidade de UI/filtros.
       price: Number(p.price),
       stock: p.stock,
       inStock: !p.trackStock || p.stock > 0,
@@ -484,7 +681,7 @@ export class CatalogTools {
     return this.prisma.category.findMany({
       where: { tenantId, active: true },
       orderBy: { order: 'asc' },
-      select: { id: true, name: true },
+      select: { id: true, name: true, description: true },
     });
   }
 

@@ -40,21 +40,29 @@ export class OllamaProvider implements LlmProvider {
   private readonly http: AxiosInstance;
   private readonly model: string;
   private readonly baseUrl: string;
+  private readonly keepAliveSeconds: number;
 
   /**
-   * Se o Ollama rejeitar o payload com `tools` (alguns modelos retornam 400),
-   * marcamos aqui pra não tentar de novo nesta sessão — evita latência extra
-   * a cada mensagem.
+   * Se o Ollama rejeitar payload com `tools` (alguns modelos retornam 400),
+   * marcamos aqui pra não retentar — evita latência extra a cada mensagem.
    */
   private toolCallingKnownBroken = false;
 
   constructor(private readonly config: ConfigService) {
     this.baseUrl = this.config.get<string>('OLLAMA_BASE_URL', 'http://localhost:11434');
     this.model = this.config.get<string>('OLLAMA_MODEL', 'llama3.1:8b');
+    // Em Ollama local, gerações longas chegam fácil em 60s. Timeout do axios
+    // só serve pra detectar travamento real do servidor, NÃO pra interromper
+    // geração lenta porém funcional. Por isso o default é alto.
+    const timeoutMs = Number(this.config.get<string>('OLLAMA_TIMEOUT_MS', '120000'));
+    // keep_alive mantém o modelo quente em VRAM/RAM entre requests. Com '5m'
+    // a primeira call paga o preço de carregar (~5-30s), as próximas vão
+    // diretas. Reduzir só se você troca muito de modelo.
+    this.keepAliveSeconds = Number(this.config.get<string>('OLLAMA_KEEP_ALIVE_S', '300'));
 
     this.http = axios.create({
       baseURL: this.baseUrl,
-      timeout: 120_000,
+      timeout: timeoutMs,
       headers: { 'Content-Type': 'application/json' },
     });
   }
@@ -95,8 +103,7 @@ export class OllamaProvider implements LlmProvider {
       if (wantsTools && this.isPayloadRejected(err)) {
         this.toolCallingKnownBroken = true;
         this.logger.warn(
-          `[ollama] modelo "${this.model}" rejeitou payload com tools. Reexecutando SEM tool calling. ` +
-            `Se isso acontecer sempre, troque para um modelo com tool calling confiável (ex: llama3.1:8b, qwen2.5:7b).`,
+          `[ollama] modelo "${this.model}" rejeitou payload com tools. Reexecutando SEM tool calling.`,
         );
         return this.doComplete(request, false);
       }
@@ -114,8 +121,13 @@ export class OllamaProvider implements LlmProvider {
       model: this.model,
       messages,
       stream: false,
+      // keep_alive em segundos. Mantém o modelo na memória entre requests.
+      keep_alive: `${this.keepAliveSeconds}s`,
       options: {
         temperature: request.temperature ?? 0.7,
+        // num_predict é o limite REAL de tokens gerados pelo Ollama (mais
+        // efetivo que max_tokens em alguns modelos). Reduzir aqui é o
+        // controle mais direto de latência.
         num_predict: request.maxTokens ?? 1024,
         ...(request.stopSequences && { stop: request.stopSequences }),
       },
@@ -132,8 +144,6 @@ export class OllamaProvider implements LlmProvider {
       }));
     }
 
-    // Ollama não aceita `format: 'json'` junto com `tools` em alguns modelos.
-    // Só setamos `format` quando NÃO há tools.
     if (request.responseFormat === 'json' && !includeTools) {
       payload.format = 'json';
     }
@@ -184,8 +194,6 @@ export class OllamaProvider implements LlmProvider {
     } catch (error) {
       const msg = this.formatAxiosError(error);
       this.logger.error(`Erro Ollama: ${msg}`);
-      // Em erro 4xx, loga um resumo do payload pra facilitar debug — sem
-      // encher o log em ambiente saudável.
       if (axios.isAxiosError(error) && error.response?.status && error.response.status < 500) {
         this.logger.debug(
           `[ollama] payload rejeitado | model=${this.model} includeTools=${includeTools} ` +
@@ -194,7 +202,6 @@ export class OllamaProvider implements LlmProvider {
             `firstMsgContent="${String((messages[0] as any)?.content ?? '').slice(0, 80)}"`,
         );
       }
-      // Repropaga com mensagem rica pra camadas acima conseguirem agir.
       const enriched: Error & { status?: number } = new Error(`Ollama request failed: ${msg}`);
       if (axios.isAxiosError(error)) enriched.status = error.response?.status;
       throw enriched;
@@ -204,7 +211,6 @@ export class OllamaProvider implements LlmProvider {
   private isPayloadRejected(err: unknown): boolean {
     if (!axios.isAxiosError(err)) return false;
     const status = err.response?.status;
-    // 400/422 = payload ruim. 404 pode ser modelo ausente. 500+ não ajuda retentar.
     return status === 400 || status === 422;
   }
 
@@ -405,15 +411,6 @@ export class OllamaProvider implements LlmProvider {
       .replace(/,\s*([}\]])/g, '$1');
   }
 
-  /**
-   * Garante que o JSON Schema das tools esteja em um formato que o Ollama aceita.
-   * Problemas observados na prática:
-   * - Tool com `properties: {}` e `required` ausente → alguns parsers rejeitam.
-   *   Solução: adicionar `properties: {}` e NÃO colocar `required` (o campo é opcional).
-   * - Campos extras no schema (ex: `default`, `examples`) → alguns builds rejeitam.
-   *   Solução: pass-through por enquanto; se virar problema, filtrar.
-   * - Schema sem `type` no root → sempre colocar `type: 'object'`.
-   */
   private sanitizeParametersSchema(parameters: unknown): Record<string, unknown> {
     if (!parameters || typeof parameters !== 'object') {
       return { type: 'object', properties: {} };
@@ -428,7 +425,6 @@ export class OllamaProvider implements LlmProvider {
           : {},
     };
 
-    // required só entra se existir, for array e tiver itens.
     if (Array.isArray(input.required) && input.required.length > 0) {
       sanitized.required = input.required.filter(
         (r) => typeof r === 'string' && r.length > 0,
@@ -457,8 +453,8 @@ export class OllamaProvider implements LlmProvider {
       return [
         '',
         '',
-        `IMPORTANTE: Você DEVE chamar UMA das seguintes ferramentas nesta resposta: ${validToolNames.join(', ')}.`,
-        'Escolha a mais adequada à mensagem do cliente. Não responda em texto antes — chame a ferramenta direto.',
+        `IMPORTANTE: Você DEVE chamar UMA das seguintes ferramentas: ${validToolNames.join(', ')}.`,
+        'Escolha a mais adequada. Não responda em texto antes — chame a ferramenta direto.',
       ].join('\n');
     }
 
@@ -467,7 +463,7 @@ export class OllamaProvider implements LlmProvider {
       return [
         '',
         '',
-        `IMPORTANTE: Você DEVE chamar EXATAMENTE a ferramenta "${choice.name}" nesta resposta.`,
+        `IMPORTANTE: Você DEVE chamar EXATAMENTE a ferramenta "${choice.name}".`,
         'Não responda em texto antes — chame a ferramenta direto.',
       ].join('\n');
     }
@@ -486,12 +482,12 @@ export class OllamaProvider implements LlmProvider {
       systemContent += [
         '',
         '',
-        'REGRAS CRÍTICAS DE USO DE FERRAMENTAS:',
-        '1. Ao chamar uma ferramenta, use APENAS o mecanismo nativo de tool calling. NUNCA escreva o JSON da chamada como texto.',
-        '2. NUNCA invente IDs. O parâmetro `productId` de check_product_availability SÓ pode ser um ID retornado antes por search_products.',
-        '3. Para buscar produtos por características (cor, tamanho, modelo), SEMPRE use search_products passando a descrição na query. Exemplo: query="iphone laranja".',
-        '4. NUNCA use check_product_availability como primeira tool — sem ID válido, use search_products.',
-        '5. Se decidir chamar uma ferramenta, responda APENAS com a chamada, sem texto antes ou depois.',
+        'REGRAS DE TOOL USE:',
+        '1. Use APENAS o mecanismo nativo de tool calling. NUNCA escreva o JSON da chamada como texto.',
+        '2. NUNCA invente IDs. productId só pode ser UUID retornado por search_products antes.',
+        '3. Para buscar por características (cor, tamanho), use search_products com a query completa.',
+        '4. Não use check_product_availability como primeira tool — sempre search_products.',
+        '5. Ao chamar tool, responda APENAS com a chamada, sem texto antes ou depois.',
       ].join('\n');
 
       const validToolNames = request.tools?.map((t) => t.name) ?? [];
@@ -505,8 +501,6 @@ export class OllamaProvider implements LlmProvider {
 
     for (const m of request.messages) {
       if (typeof m.content === 'string') {
-        // Ollama não tem role 'tool' fora de tool_calls em alguns modelos.
-        // Coagimos 'tool' → 'user' pra não quebrar o payload.
         const role = m.role === 'tool' ? 'user' : m.role;
         result.push({ role: role as any, content: m.content });
         continue;

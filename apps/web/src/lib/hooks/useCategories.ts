@@ -21,6 +21,20 @@ export interface CategoryInput {
   active?: boolean;
 }
 
+export interface CategoryTemplateGroup {
+  id: string;
+  name: string;
+  description: string;
+  segment: string;
+  count: number;
+  categories: Array<{
+    name: string;
+    slug: string;
+    description: string;
+    order: number;
+  }>;
+}
+
 export function useCategories(onlyActive = false) {
   return useQuery({
     queryKey: ['categories', { onlyActive }],
@@ -72,6 +86,42 @@ export function useDeleteCategory() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['categories'] });
       toast.success('Categoria removida');
+    },
+    onError: (e) => toast.error(extractApiError(e)),
+  });
+}
+
+export function useCategoryTemplates() {
+  return useQuery({
+    queryKey: ['category-templates'],
+    queryFn: async () => {
+      const { data } = await api.get<CategoryTemplateGroup[]>('/categories/templates');
+      return data;
+    },
+    staleTime: Infinity, // estes nunca mudam em runtime
+  });
+}
+
+export function useImportCategoryTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { groupId: string; slugs?: string[] }) => {
+      const { data } = await api.post<{
+        imported: number;
+        skipped: number;
+        message?: string;
+      }>('/categories/import-template', payload);
+      return data;
+    },
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ['categories'] });
+      const noun = data.imported === 1 ? 'categoria importada' : 'categorias importadas';
+      const skipMsg = data.skipped > 0 ? ` (${data.skipped} já existiam)` : '';
+      if (data.imported === 0) {
+        toast.info(data.message ?? 'Nenhuma categoria nova para importar');
+      } else {
+        toast.success(`${data.imported} ${noun}${skipMsg}`);
+      }
     },
     onError: (e) => toast.error(extractApiError(e)),
   });
