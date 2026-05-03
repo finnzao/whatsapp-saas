@@ -1,259 +1,200 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
+import { Subject, fromEvent, merge, of } from 'rxjs';
+import { map } from 'rxjs/operators';
 
 import { PrismaService } from '../../common/prisma/prisma.service';
-import { AutomationsService } from '../automations/automations.service';
+import { InboundDebouncerService } from '../automations/inbound-debouncer.service';
+import { APP_EVENTS } from '../../common/events/event.constants';
 import {
-  APP_EVENTS,
   OutboundMessageRequestedEvent,
-  ConversationHandoffRequestedEvent,
-} from '../../common/events/app-events';
+  HandoffEscalatedEvent,
+} from '../../common/events/event.types';
+
+export type DebugStreamEvent =
+  | {
+      type: 'message';
+      payload: {
+        id: string;
+        direction: 'INBOUND' | 'OUTBOUND';
+        content: string;
+        createdAt: string;
+        conversationId: string;
+      };
+    }
+  | { type: 'typing_start'; payload: { conversationId: string } }
+  | { type: 'typing_end'; payload: { conversationId: string } }
+  | {
+      type: 'handoff';
+      payload: { conversationId: string; reason: string };
+    }
+  | { type: 'heartbeat'; payload: { ts: number } };
 
 const DEBUG_CONTACT_PREFIX = 'debug-';
-
-export interface DebugEvent {
-  type: 'bot_reply' | 'handoff';
-  content: string;
-  reason?: string;
-  timestamp: string;
-}
+const HEARTBEAT_MS = 25_000;
 
 @Injectable()
-export class DebugService implements OnModuleInit {
+export class DebugService implements OnModuleDestroy {
   private readonly logger = new Logger(DebugService.name);
-
-  private readonly pendingEvents = new Map<string, DebugEvent[]>();
+  private readonly streamsByTenant = new Map<string, Subject<DebugStreamEvent>>();
+  private readonly conversationToTenant = new Map<string, string>();
+  private readonly heartbeatInterval: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly automations: AutomationsService,
-  ) {}
-
-  onModuleInit() {
-    this.logger.log('Debug sandbox habilitado. Use POST /debug/simulate-inbound para testar.');
+    private readonly debouncer: InboundDebouncerService,
+  ) {
+    this.heartbeatInterval = setInterval(() => {
+      const ts = Date.now();
+      for (const subject of this.streamsByTenant.values()) {
+        subject.next({ type: 'heartbeat', payload: { ts } });
+      }
+    }, HEARTBEAT_MS);
   }
 
-  async simulateInbound(tenantId: string, text: string, contactName?: string) {
+  onModuleDestroy() {
+    clearInterval(this.heartbeatInterval);
+    for (const subject of this.streamsByTenant.values()) {
+      subject.complete();
+    }
+    this.streamsByTenant.clear();
+    this.conversationToTenant.clear();
+  }
+
+  streamForTenant(tenantId: string) {
+    const subject = this.getOrCreateStream(tenantId);
+    return merge(
+      of({ type: 'heartbeat' as const, payload: { ts: Date.now() } }),
+      subject.asObservable(),
+    ).pipe(map((event) => ({ data: event })));
+  }
+
+  async simulateInbound(
+    tenantId: string,
+    text: string,
+  ): Promise<{ accepted: true; conversationId: string }> {
     const phone = `${DEBUG_CONTACT_PREFIX}${tenantId.slice(0, 8)}`;
 
     const contact = await this.prisma.contact.upsert({
       where: { tenantId_phone: { tenantId, phone } },
+      update: {},
       create: {
         tenantId,
         phone,
-        name: contactName ?? 'Cliente Debug',
-        pushName: contactName ?? 'Cliente Debug',
-        metadata: { debug: true },
-      },
-      update: {
-        ...(contactName && { name: contactName, pushName: contactName }),
+        name: 'Debug Console',
       },
     });
 
-    let conversation = await this.prisma.conversation.findFirst({
-      where: {
-        tenantId,
-        contactId: contact.id,
-        status: { notIn: ['ARCHIVED', 'RESOLVED'] },
-      },
-      orderBy: { updatedAt: 'desc' },
-    });
+    const conversation = await this.findOrCreateActiveConversation(tenantId, contact.id);
 
-    if (!conversation) {
-      conversation = await this.prisma.conversation.create({
-        data: {
-          tenantId,
-          contactId: contact.id,
-          status: 'BOT',
-          metadata: { debug: true },
-        },
-      });
-    } else if (!this.isDebugMetadata(conversation.metadata)) {
-      conversation = await this.prisma.conversation.update({
-        where: { id: conversation.id },
-        data: { metadata: { debug: true } },
-      });
-    }
-
-    await this.prisma.message.create({
+    const message = await this.prisma.message.create({
       data: {
         tenantId,
         conversationId: conversation.id,
         contactId: contact.id,
         direction: 'INBOUND',
-        type: 'TEXT',
         content: text,
-        status: 'DELIVERED',
-        fromBot: false,
+        status: 'RECEIVED',
       },
     });
 
-    await this.prisma.conversation.update({
-      where: { id: conversation.id },
-      data: { lastMessageAt: new Date() },
+    this.conversationToTenant.set(conversation.id, tenantId);
+
+    const subject = this.getOrCreateStream(tenantId);
+    subject.next({
+      type: 'message',
+      payload: {
+        id: message.id,
+        direction: 'INBOUND',
+        content: text,
+        createdAt: message.createdAt.toISOString(),
+        conversationId: conversation.id,
+      },
+    });
+    subject.next({
+      type: 'typing_start',
+      payload: { conversationId: conversation.id },
     });
 
-    this.pendingEvents.set(conversation.id, []);
-    this.logger.debug(`[debug] Buffer criado para conversa ${conversation.id}`);
-
-    try {
-      await this.automations.handleIncomingMessage({
-        tenantId,
-        conversationId: conversation.id,
-        contactId: contact.id,
-        messageText: text,
-      });
-      this.logger.debug(`[debug] handleIncomingMessage retornou para ${conversation.id}`);
-    } catch (err) {
-      this.logger.error(`[debug] Erro em handleIncomingMessage: ${(err as Error).message}`);
-    }
-
-    const events = await this.waitForReply(conversation.id, 15_000);
-    this.pendingEvents.delete(conversation.id);
-
-    this.logger.debug(`[debug] Retornando ${events.length} eventos para ${conversation.id}`);
-
-    return {
+    await this.debouncer.enqueue({
+      tenantId,
       conversationId: conversation.id,
       contactId: contact.id,
-      events,
-    };
+      phone,
+      instanceName: null,
+      messageId: message.id,
+      messageText: text,
+      isDebug: true,
+    });
+
+    return { accepted: true, conversationId: conversation.id };
   }
 
-  async resetConversation(tenantId: string) {
-    const phone = `${DEBUG_CONTACT_PREFIX}${tenantId.slice(0, 8)}`;
-    const contact = await this.prisma.contact.findUnique({
-      where: { tenantId_phone: { tenantId, phone } },
+  @OnEvent(APP_EVENTS.OUTBOUND_MESSAGE_REQUESTED)
+  onOutbound(event: OutboundMessageRequestedEvent) {
+    const tenantId = this.conversationToTenant.get(event.conversationId);
+    if (!tenantId) return;
+
+    const subject = this.streamsByTenant.get(tenantId);
+    if (!subject) return;
+
+    subject.next({
+      type: 'typing_end',
+      payload: { conversationId: event.conversationId },
     });
-
-    if (!contact) return { reset: false };
-
-    await this.prisma.conversation.deleteMany({
-      where: { tenantId, contactId: contact.id },
-    });
-
-    return { reset: true };
-  }
-
-  async getHistory(tenantId: string) {
-    const phone = `${DEBUG_CONTACT_PREFIX}${tenantId.slice(0, 8)}`;
-    const contact = await this.prisma.contact.findUnique({
-      where: { tenantId_phone: { tenantId, phone } },
-    });
-
-    if (!contact) return { messages: [], conversationId: null };
-
-    const conversation = await this.prisma.conversation.findFirst({
-      where: {
-        tenantId,
-        contactId: contact.id,
-        status: { notIn: ['ARCHIVED', 'RESOLVED'] },
+    subject.next({
+      type: 'message',
+      payload: {
+        id: event.messageId,
+        direction: 'OUTBOUND',
+        content: event.content,
+        createdAt: new Date().toISOString(),
+        conversationId: event.conversationId,
       },
+    });
+  }
+
+  @OnEvent(APP_EVENTS.HANDOFF_ESCALATED)
+  onHandoff(event: HandoffEscalatedEvent) {
+    const tenantId = this.conversationToTenant.get(event.conversationId);
+    if (!tenantId) return;
+
+    const subject = this.streamsByTenant.get(tenantId);
+    if (!subject) return;
+
+    subject.next({
+      type: 'typing_end',
+      payload: { conversationId: event.conversationId },
+    });
+    subject.next({
+      type: 'handoff',
+      payload: { conversationId: event.conversationId, reason: event.reason },
+    });
+  }
+
+  private async findOrCreateActiveConversation(tenantId: string, contactId: string) {
+    const existing = await this.prisma.conversation.findFirst({
+      where: { tenantId, contactId, status: { in: ['BOT', 'HUMAN'] } },
       orderBy: { updatedAt: 'desc' },
     });
+    if (existing) return existing;
 
-    if (!conversation) return { messages: [], conversationId: null };
-
-    const messages = await this.prisma.message.findMany({
-      where: { conversationId: conversation.id },
-      orderBy: { createdAt: 'asc' },
+    return this.prisma.conversation.create({
+      data: { tenantId, contactId, status: 'BOT', instanceName: 'debug' },
     });
-
-    return {
-      conversationId: conversation.id,
-      status: conversation.status,
-      messages: messages.map((m) => ({
-        id: m.id,
-        direction: m.direction,
-        content: m.content,
-        fromBot: m.fromBot,
-        createdAt: m.createdAt,
-      })),
-    };
   }
 
-  @OnEvent(APP_EVENTS.OUTBOUND_MESSAGE_REQUESTED, { async: true })
-  async captureOutbound(event: OutboundMessageRequestedEvent) {
-    this.logger.debug(
-      `[debug] captureOutbound | conversa=${event.conversationId} | isDebug=${this.pendingEvents.has(event.conversationId)}`,
-    );
-
-    if (!this.pendingEvents.has(event.conversationId)) return;
-
-    try {
-      await this.prisma.message.create({
-        data: {
-          tenantId: event.tenantId,
-          conversationId: event.conversationId,
-          contactId: event.contactId,
-          direction: 'OUTBOUND',
-          type: 'TEXT',
-          content: event.text,
-          status: 'SENT',
-          fromBot: event.fromBot,
-        },
-      });
-    } catch (err) {
-      this.logger.error(`[debug] Erro ao salvar mensagem de bot: ${(err as Error).message}`);
+  private getOrCreateStream(tenantId: string): Subject<DebugStreamEvent> {
+    let subject = this.streamsByTenant.get(tenantId);
+    if (!subject) {
+      subject = new Subject<DebugStreamEvent>();
+      this.streamsByTenant.set(tenantId, subject);
     }
-
-    const captured = this.pendingEvents.get(event.conversationId);
-    captured?.push({
-      type: 'bot_reply',
-      content: event.text,
-      timestamp: new Date().toISOString(),
-    });
-
-    this.logger.debug(
-      `[debug] bot_reply adicionado ao buffer de ${event.conversationId} | total=${captured?.length}`,
-    );
-  }
-
-  @OnEvent(APP_EVENTS.CONVERSATION_HANDOFF_REQUESTED, { async: true })
-  async captureHandoff(event: ConversationHandoffRequestedEvent) {
-    this.logger.debug(
-      `[debug] captureHandoff | conversa=${event.conversationId} | isDebug=${this.pendingEvents.has(event.conversationId)}`,
-    );
-
-    if (!this.pendingEvents.has(event.conversationId)) return;
-
-    const captured = this.pendingEvents.get(event.conversationId);
-    captured?.push({
-      type: 'handoff',
-      content: 'Conversa transferida para atendimento humano',
-      reason: event.reason,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  private isDebugMetadata(metadata: unknown): boolean {
-    if (!metadata || typeof metadata !== 'object') return false;
-    return (metadata as { debug?: boolean }).debug === true;
-  }
-
-  private async waitForReply(conversationId: string, timeoutMs: number): Promise<DebugEvent[]> {
-    const start = Date.now();
-    const pollInterval = 100;
-    const quietPeriod = 300;
-
-    let lastEventCount = 0;
-    let lastChangeAt = start;
-
-    while (Date.now() - start < timeoutMs) {
-      const events = this.pendingEvents.get(conversationId) ?? [];
-
-      if (events.length !== lastEventCount) {
-        lastEventCount = events.length;
-        lastChangeAt = Date.now();
-      }
-
-      if (events.length > 0 && Date.now() - lastChangeAt >= quietPeriod) {
-        return [...events];
-      }
-
-      await new Promise((r) => setTimeout(r, pollInterval));
-    }
-
-    return [...(this.pendingEvents.get(conversationId) ?? [])];
+    return subject;
   }
 }

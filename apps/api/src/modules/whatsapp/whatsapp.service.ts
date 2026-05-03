@@ -4,6 +4,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import {
   WHATSAPP_PROVIDER,
   WhatsappProvider,
+  PresenceState,
 } from './whatsapp-provider.interface';
 
 @Injectable()
@@ -16,10 +17,6 @@ export class WhatsappService {
     private readonly config: ConfigService,
   ) {}
 
-  /**
-   * Cria nova instância de WhatsApp para um tenant.
-   * O instanceName é único globalmente, usamos o tenantId pra garantir.
-   */
   async createInstanceForTenant(tenantId: string) {
     const instanceName = `tenant_${tenantId.replace(/-/g, '').slice(0, 16)}`;
     const webhookUrl = `${this.config.get('APP_URL')}/webhooks/evolution`;
@@ -75,9 +72,6 @@ export class WhatsappService {
     });
   }
 
-  /**
-   * Envia mensagem de texto. Resolve a instância do tenant automaticamente.
-   */
   async sendText(tenantId: string, to: string, text: string) {
     const instance = await this.getConnectedInstance(tenantId);
     return this.provider.sendTextMessage({
@@ -102,6 +96,27 @@ export class WhatsappService {
       mediaType,
       caption,
     });
+  }
+
+  async sendPresence(
+    tenantId: string,
+    to: string,
+    presence: PresenceState,
+    delayMs?: number,
+  ): Promise<void> {
+    try {
+      const instance = await this.getConnectedInstance(tenantId);
+      await this.provider.sendPresence({
+        instanceName: instance.instanceName,
+        to,
+        presence,
+        delayMs,
+      });
+    } catch (err) {
+      this.logger.debug(
+        `[whatsapp] sendPresence ignorado (best-effort): ${(err as Error).message}`,
+      );
+    }
   }
 
   async findInstanceByName(instanceName: string) {

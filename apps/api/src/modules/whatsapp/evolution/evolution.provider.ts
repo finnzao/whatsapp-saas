@@ -9,12 +9,9 @@ import {
   SendTextParams,
   SendMediaParams,
   SendMessageResult,
+  SendPresenceParams,
 } from '../whatsapp-provider.interface';
 
-/**
- * Adapter da Evolution API v2.
- * Documentação: https://doc.evolution-api.com
- */
 @Injectable()
 export class EvolutionProvider implements WhatsappProvider {
   private readonly logger = new Logger(EvolutionProvider.name);
@@ -125,6 +122,20 @@ export class EvolutionProvider implements WhatsappProvider {
     };
   }
 
+  async sendPresence(params: SendPresenceParams): Promise<void> {
+    try {
+      await this.http.post(`/chat/sendPresence/${params.instanceName}`, {
+        number: this.formatPhone(params.to),
+        presence: params.presence,
+        delay: params.delayMs ?? 1200,
+      });
+    } catch (error: any) {
+      this.logger.debug(
+        `[evolution] sendPresence falhou (best-effort, ignorando): ${error.response?.status ?? error.code} ${error.message}`,
+      );
+    }
+  }
+
   async setWebhook(instanceName: string, url: string, events: string[]): Promise<void> {
     await this.http.post(`/webhook/set/${instanceName}`, {
       enabled: true,
@@ -148,7 +159,6 @@ export class EvolutionProvider implements WhatsappProvider {
   }
 
   private formatPhone(phone: string): string {
-    // Evolution espera número sem formatação, com DDI
     return phone.replace(/\D/g, '');
   }
 }

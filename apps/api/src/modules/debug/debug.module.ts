@@ -1,15 +1,26 @@
 import { Module } from '@nestjs/common';
-import { DebugController } from './debug.controller';
+import { JwtModule } from '@nestjs/jwt';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+
 import { DebugService } from './debug.service';
-import { CatalogDiagController, CatalogDiagService } from './catalog-diag';
-import { CatalogTools } from '../ai/catalog.tools';
-import { AiModule } from '../ai/ai.module';
+import { DebugController } from './debug.controller';
 import { AutomationsModule } from '../automations/automations.module';
+import { PrismaModule } from '../../common/prisma/prisma.module';
 
 @Module({
-  imports: [AiModule, AutomationsModule],
-  controllers: [DebugController, CatalogDiagController],
-  providers: [DebugService, CatalogDiagService, CatalogTools],
+  imports: [
+    PrismaModule,
+    AutomationsModule,
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      useFactory: (config: ConfigService) => ({
+        secret: config.get<string>('JWT_SECRET'),
+      }),
+      inject: [ConfigService],
+    }),
+  ],
+  controllers: [DebugController],
+  providers: [DebugService],
   exports: [DebugService],
 })
 export class DebugModule {}

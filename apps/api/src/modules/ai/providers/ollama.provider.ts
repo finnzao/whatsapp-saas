@@ -32,6 +32,17 @@ interface OllamaChatResponse {
   eval_count?: number;
 }
 
+export class ProviderUnavailableError extends Error {
+  readonly code = 'PROVIDER_UNAVAILABLE';
+  reopensInMs: any;
+  constructor(readonly providerName: string, readonly until: number) {
+    super(
+      `Provider "${providerName}" indisponível (circuito aberto até ${new Date(until).toISOString()})`,
+    );
+    this.name = 'ProviderUnavailableError';
+  }
+}
+
 @Injectable()
 export class OllamaProvider implements LlmProvider {
   readonly name = 'ollama';
@@ -42,23 +53,22 @@ export class OllamaProvider implements LlmProvider {
   private readonly baseUrl: string;
   private readonly keepAliveSeconds: number;
 
-  /**
-   * Se o Ollama rejeitar payload com `tools` (alguns modelos retornam 400),
-   * marcamos aqui pra não retentar — evita latência extra a cada mensagem.
-   */
   private toolCallingKnownBroken = false;
+
+  private readonly breakerCooldownMs: number;
+  private breakerOpenUntil = 0;
+  private lastBreakerLogAt = 0;
+  private availabilityCache: { ok: boolean; expiresAt: number } | null = null;
+  private readonly availabilityTtlMs = 5_000;
 
   constructor(private readonly config: ConfigService) {
     this.baseUrl = this.config.get<string>('OLLAMA_BASE_URL', 'http://localhost:11434');
     this.model = this.config.get<string>('OLLAMA_MODEL', 'llama3.1:8b');
-    // Em Ollama local, gerações longas chegam fácil em 60s. Timeout do axios
-    // só serve pra detectar travamento real do servidor, NÃO pra interromper
-    // geração lenta porém funcional. Por isso o default é alto.
     const timeoutMs = Number(this.config.get<string>('OLLAMA_TIMEOUT_MS', '120000'));
-    // keep_alive mantém o modelo quente em VRAM/RAM entre requests. Com '5m'
-    // a primeira call paga o preço de carregar (~5-30s), as próximas vão
-    // diretas. Reduzir só se você troca muito de modelo.
     this.keepAliveSeconds = Number(this.config.get<string>('OLLAMA_KEEP_ALIVE_S', '300'));
+    this.breakerCooldownMs = Number(
+      this.config.get<string>('OLLAMA_BREAKER_COOLDOWN_MS', '30000'),
+    );
 
     this.http = axios.create({
       baseURL: this.baseUrl,
@@ -79,6 +89,13 @@ export class OllamaProvider implements LlmProvider {
   }
 
   async isAvailable(): Promise<boolean> {
+    if (this.isBreakerOpen()) return false;
+
+    const now = Date.now();
+    if (this.availabilityCache && now < this.availabilityCache.expiresAt) {
+      return this.availabilityCache.ok;
+    }
+
     try {
       const { data } = await this.http.get('/api/tags');
       const models = (data.models ?? []) as Array<{ name: string }>;
@@ -88,13 +105,20 @@ export class OllamaProvider implements LlmProvider {
           `Ollama disponível mas modelo "${this.model}" não está baixado. Rode: ollama pull ${this.model}`,
         );
       }
+      this.availabilityCache = { ok: hasModel, expiresAt: now + this.availabilityTtlMs };
       return hasModel;
-    } catch {
+    } catch (err) {
+      this.tripBreaker(err);
+      this.availabilityCache = { ok: false, expiresAt: now + this.availabilityTtlMs };
       return false;
     }
   }
 
   async complete(request: LlmCompletionRequest): Promise<LlmCompletionResponse> {
+    if (this.isBreakerOpen()) {
+      throw new ProviderUnavailableError(this.name, this.breakerOpenUntil);
+    }
+
     const wantsTools = !!(request.tools && request.tools.length > 0 && this.supportsToolCalling());
 
     try {
@@ -111,6 +135,44 @@ export class OllamaProvider implements LlmProvider {
     }
   }
 
+  private isBreakerOpen(): boolean {
+    if (this.breakerOpenUntil === 0) return false;
+    if (Date.now() >= this.breakerOpenUntil) {
+      this.logger.log(`[ollama][breaker] cooldown expirou, reabrindo tentativas`);
+      this.breakerOpenUntil = 0;
+      this.availabilityCache = null;
+      return false;
+    }
+    return true;
+  }
+
+  private tripBreaker(err: unknown): void {
+    if (!this.isConnectivityError(err)) return;
+    const now = Date.now();
+    this.breakerOpenUntil = now + this.breakerCooldownMs;
+    this.availabilityCache = { ok: false, expiresAt: now + this.availabilityTtlMs };
+    if (now - this.lastBreakerLogAt > 5000) {
+      this.lastBreakerLogAt = now;
+      const reason = this.formatAxiosError(err);
+      this.logger.warn(
+        `[ollama][breaker] abrindo circuito por ${this.breakerCooldownMs}ms — ${reason}`,
+      );
+    }
+  }
+
+  private isConnectivityError(err: unknown): boolean {
+    if (!axios.isAxiosError(err)) return false;
+    const code = err.code;
+    return (
+      code === 'ECONNREFUSED' ||
+      code === 'ECONNABORTED' ||
+      code === 'ENOTFOUND' ||
+      code === 'EHOSTUNREACH' ||
+      code === 'ETIMEDOUT' ||
+      err.response === undefined
+    );
+  }
+
   private async doComplete(
     request: LlmCompletionRequest,
     includeTools: boolean,
@@ -121,13 +183,9 @@ export class OllamaProvider implements LlmProvider {
       model: this.model,
       messages,
       stream: false,
-      // keep_alive em segundos. Mantém o modelo na memória entre requests.
       keep_alive: `${this.keepAliveSeconds}s`,
       options: {
         temperature: request.temperature ?? 0.7,
-        // num_predict é o limite REAL de tokens gerados pelo Ollama (mais
-        // efetivo que max_tokens em alguns modelos). Reduzir aqui é o
-        // controle mais direto de latência.
         num_predict: request.maxTokens ?? 1024,
         ...(request.stopSequences && { stop: request.stopSequences }),
       },
@@ -192,6 +250,7 @@ export class OllamaProvider implements LlmProvider {
         },
       };
     } catch (error) {
+      this.tripBreaker(error);
       const msg = this.formatAxiosError(error);
       this.logger.error(`Erro Ollama: ${msg}`);
       if (axios.isAxiosError(error) && error.response?.status && error.response.status < 500) {

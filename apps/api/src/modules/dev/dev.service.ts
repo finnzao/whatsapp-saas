@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { CatalogTools } from '../ai/catalog.tools';
+import { tokenize } from '../../common/utils/text-normalize';
 
 export type DevEntity =
   | 'products'
@@ -164,7 +165,7 @@ export class DevService {
     const searchResult = await this.catalog.searchProducts(tenantId, { query, limit });
     return {
       query,
-      tokens: this.extractTokens(query),
+      tokens: tokenize(query),
       matchQuality: searchResult.matchQuality,
       totalCandidates: searchResult.totalCandidates,
       resultsCount: searchResult.results.length,
@@ -341,15 +342,5 @@ export class DevService {
     const model = this.getModel(entity);
     const record = await (model as any).findFirst({ where: { id, tenantId } });
     return record;
-  }
-
-  private extractTokens(query: string): string[] {
-    return query
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .split(/\s+/)
-      .filter((t) => t.length >= 2);
   }
 }

@@ -54,13 +54,12 @@ export class IntentClassifier {
     const available = await this.provider.isAvailable();
     if (!available) {
       this.logger.warn(
-        `[intent] provider ${this.provider.name} indisponível, caindo no primeiro match`,
+        `[intent] provider ${this.provider.name} indisponível — não retornando match (delega ao agent principal)`,
       );
       return {
-        matched: true,
-        faqId: candidates[0].id,
+        matched: false,
         confidence: 'low',
-        reason: 'provider unavailable, fallback',
+        reason: 'classifier unavailable',
       };
     }
 
@@ -71,10 +70,9 @@ export class IntentClassifier {
     } catch (error) {
       this.logger.error(`[intent] erro ao classificar: ${(error as Error).message}`);
       return {
-        matched: true,
-        faqId: candidates[0].id,
+        matched: false,
         confidence: 'low',
-        reason: 'classifier error, fallback',
+        reason: 'classifier error',
       };
     }
   }

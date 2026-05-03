@@ -1,36 +1,40 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { BullModule } from '@nestjs/bullmq';
 
 import { WhatsappService } from './whatsapp.service';
-import { WhatsappController } from './whatsapp.controller';
+import { WhatsappPresenceService } from './whatsapp-presence.service';
 import { EvolutionProvider } from './evolution/evolution.provider';
-import { EvolutionWebhookController } from './webhooks/evolution.controller';
+import { WHATSAPP_PROVIDER } from './whatsapp-provider.interface';
 import { InboundMessageProcessor } from './webhooks/inbound-message.processor';
 import { WhatsappEventsListener } from './listeners/whatsapp-events.listener';
-import { WHATSAPP_PROVIDER } from './whatsapp-provider.interface';
-import { QUEUE_NAMES } from '../../queue/queue.constants';
+import { WhatsappController } from './whatsapp.controller';
+import { WebhooksController } from './webhooks/webhooks.controller';
+import { PrismaModule } from '../../common/prisma/prisma.module';
 import { AutomationsModule } from '../automations/automations.module';
-import { AiModule } from '../ai/ai.module';
+import { QUEUE_NAMES } from '../../queue/queue.constants';
 
 @Module({
   imports: [
+    ConfigModule,
+    PrismaModule,
+    forwardRef(() => AutomationsModule),
     BullModule.registerQueue(
       { name: QUEUE_NAMES.INBOUND_MESSAGES },
       { name: QUEUE_NAMES.OUTBOUND_MESSAGES },
     ),
-    AutomationsModule,
-    AiModule,
   ],
-  controllers: [WhatsappController, EvolutionWebhookController],
+  controllers: [WhatsappController, WebhooksController],
   providers: [
     WhatsappService,
-    InboundMessageProcessor,
-    WhatsappEventsListener,
+    WhatsappPresenceService,
     {
       provide: WHATSAPP_PROVIDER,
       useClass: EvolutionProvider,
     },
+    InboundMessageProcessor,
+    WhatsappEventsListener,
   ],
-  exports: [WhatsappService, WHATSAPP_PROVIDER],
+  exports: [WhatsappService, WhatsappPresenceService],
 })
 export class WhatsappModule {}

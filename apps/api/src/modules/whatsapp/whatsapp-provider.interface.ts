@@ -1,9 +1,3 @@
-/**
- * Abstração do provider de WhatsApp.
- * Permite trocar entre Evolution API (não-oficial) e Cloud API (oficial)
- * sem mexer na lógica de negócio.
- */
-
 export interface WhatsappProvider {
   createInstance(params: CreateInstanceParams): Promise<CreateInstanceResult>;
   deleteInstance(instanceName: string): Promise<void>;
@@ -12,6 +6,7 @@ export interface WhatsappProvider {
 
   sendTextMessage(params: SendTextParams): Promise<SendMessageResult>;
   sendMediaMessage(params: SendMediaParams): Promise<SendMessageResult>;
+  sendPresence(params: SendPresenceParams): Promise<void>;
 
   setWebhook(instanceName: string, url: string, events: string[]): Promise<void>;
 }
@@ -44,6 +39,15 @@ export interface SendMediaParams {
   mediaType: 'image' | 'video' | 'audio' | 'document';
   caption?: string;
   fileName?: string;
+}
+
+export type PresenceState = 'composing' | 'available' | 'paused' | 'recording';
+
+export interface SendPresenceParams {
+  instanceName: string;
+  to: string;
+  presence: PresenceState;
+  delayMs?: number;
 }
 
 export interface SendMessageResult {

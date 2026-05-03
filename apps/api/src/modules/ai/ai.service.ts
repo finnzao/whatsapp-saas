@@ -13,13 +13,17 @@ import {
   LlmCompletionRequest,
   LlmCompletionResponse,
 } from './providers/llm-provider.interface';
+import { ProviderUnavailableError } from './providers/ollama.provider';
 import { withTimeout, timed, formatDuration, LlmTimeoutError } from './llm-timeout.util';
+import { fingerprint } from '../../common/utils/text-normalize';
+import type { MessageIntent } from './message-intent-classifier.service';
 
 interface GenerateReplyParams {
   tenantId: string;
   conversationId: string;
   userMessage: string;
   instructions?: string;
+  intent?: MessageIntent;
 }
 
 interface AiReplyResult {
@@ -28,27 +32,12 @@ interface AiReplyResult {
   handoffReason?: string;
 }
 
-const PRODUCT_INTENT_PATTERNS = [
-  /\bo que (voc[êe]s? )?vend[ea]/i,
-  /\bquais produtos/i,
-  /\bquais categorias/i,
-  /\bo que tem/i,
-  /\bque tipo de/i,
-  /\btem\s+(?:pra|para)\s+vender/i,
-  /\bquero (ver|comprar|saber|um|uma)/i,
-  /\bme mostra/i,
-  /\bvoc[êe]s? tem\b/i,
-  /\btem\b.{0,40}\?/i,
-  /\bprocuro\b/i,
-  /\bprecisando de/i,
-  /\bcat[áa]logo/i,
-  /\bprodut/i,
-  /\b(iphone|xiaomi|samsung|motorola|apple|celular|smartphone|capinha|pel[íi]cula|fone|carregador|airpod|notebook|tv|cabo|capa)\b/i,
-];
-
-function looksLikeProductQuery(text: string): boolean {
-  return PRODUCT_INTENT_PATTERNS.some((p) => p.test(text));
-}
+const PRODUCT_ORIENTED_INTENTS: ReadonlySet<MessageIntent> = new Set<MessageIntent>([
+  'product_search',
+  'product_question',
+  'category_browse',
+  'price_inquiry',
+]);
 
 const TIMEOUT_FALLBACK_MESSAGE =
   'Estou com lentidão para consultar isso agora. Pode me dar mais detalhes ou tentar novamente em alguns segundos?';
@@ -104,7 +93,6 @@ export class AiService {
     const start = Date.now();
     const remainingBudget = () => Math.max(0, this.totalBudgetMs - (Date.now() - start));
 
-    // Cache de respostas idênticas. Não cacheamos respostas com handoff.
     const cacheKey = this.buildCacheKey(params);
     const cached = this.replyCache.get(cacheKey);
     if (cached) {
@@ -126,13 +114,7 @@ export class AiService {
       parameters: t.input_schema ?? t.parameters,
     }));
 
-    // NÃO usamos mais fast-path que injeta search_products direto. A versão
-    // anterior ignorava matchQuality e o modelo via "tem produto" mesmo
-    // quando matchQuality era 'none' — causando alucinação grave (vendeu
-    // Galaxy S24 quando cliente pediu carregador). Agora o LLM SEMPRE chama
-    // a tool e SEMPRE lê o hint, que é claro sobre o que fazer.
-
-    const forceTool = looksLikeProductQuery(params.userMessage);
+    const forceTool = this.shouldForceTool(params.intent);
     const toolResultsSeen: string[] = [];
     let lastTextResponse: string | undefined;
 
@@ -174,6 +156,12 @@ export class AiService {
           `[ai] iter#${i + 1} completou em ${formatDuration(durationMs)}${usage} | stop=${response.stopReason} | tools=${response.toolCalls.length}`,
         );
       } catch (err) {
+        if (err instanceof ProviderUnavailableError) {
+          this.logger.warn(
+            `[ai] iter#${i + 1} provider offline (circuit aberto, reabre em ${err.reopensInMs}ms) — encaminhando para handoff`,
+          );
+          return { handoff: true, handoffReason: 'llm provider unavailable' };
+        }
         if (err instanceof LlmTimeoutError) {
           this.logger.error(
             `[ai] iter#${i + 1} timeout após ${formatDuration(callTimeout)}: ${err.message}`,
@@ -266,9 +254,13 @@ export class AiService {
     };
   }
 
+  private shouldForceTool(intent?: MessageIntent): boolean {
+    if (!intent) return false;
+    return PRODUCT_ORIENTED_INTENTS.has(intent);
+  }
+
   private buildCacheKey(params: GenerateReplyParams): string {
-    const normalized = params.userMessage.toLowerCase().trim().replace(/\s+/g, ' ');
-    return `${params.tenantId}::${normalized}`;
+    return `${params.tenantId}::${fingerprint(params.userMessage)}`;
   }
 
   private completeWithTimeout(
@@ -353,9 +345,15 @@ export class AiService {
         }]. Usando fallback sem preço.`,
       );
     } catch (err) {
-      this.logger.error(
-        `[ai][guardrail] erro ao regenerar: ${(err as Error).message}. Usando fallback sem preço.`,
-      );
+      if (err instanceof ProviderUnavailableError) {
+        this.logger.warn(
+          `[ai][guardrail] provider ficou offline durante regenerate — usando fallback`,
+        );
+      } else {
+        this.logger.error(
+          `[ai][guardrail] erro ao regenerar: ${(err as Error).message}. Usando fallback sem preço.`,
+        );
+      }
     }
 
     return this.stripPricesFromText(text);
@@ -374,13 +372,6 @@ export class AiService {
     return `${stripped}\n\n(obs.: não consegui confirmar o valor agora, pode me perguntar o preço de novo que eu confiro?)`;
   }
 
-  /**
-   * System prompt curto + reforço EXPLÍCITO de matchQuality.
-   * O incidente que motivou esta versão: cliente perguntou "carregadores
-   * para samsung", a tool retornou Galaxy S24 (porque tinha "samsung" no
-   * nome) e o bot vendeu Galaxy como se fosse carregador. As regras 3-4
-   * tornam isso impossível.
-   */
   private buildSystemPrompt(customInstructions?: string): string {
     return [
       'Você é atendente virtual de uma loja no WhatsApp. Curto, cordial, em português brasileiro.',

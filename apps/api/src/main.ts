@@ -51,13 +51,13 @@ async function bootstrap() {
   await app.listen(port);
 
   const logger = new Logger('Bootstrap');
-  logger.log(`🚀 API pronta em http://localhost:${port}`);
-  logger.log(`📚 Docs em http://localhost:${port}/docs`);
+  logger.log(`API pronta em http://localhost:${port}`);
+  logger.log(`http://localhost:${port}/docs`);
 
   const isDev = process.env.NODE_ENV !== 'production';
   if (isDev) {
     logger.log(
-      `💡 Logs: ${process.env.PRISMA_LOG === 'query' ? 'SQL verboso ligado' : 'SQL silencioso (PRISMA_LOG=query para ligar)'}`,
+      `Logs: ${process.env.PRISMA_LOG === 'query' ? 'SQL verboso ligado' : 'SQL silencioso (PRISMA_LOG=query para ligar)'}`,
     );
   }
 }
