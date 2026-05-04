@@ -7,24 +7,22 @@ import { WhatsappPresenceService } from './whatsapp-presence.service';
 import { EvolutionProvider } from './evolution/evolution.provider';
 import { WHATSAPP_PROVIDER } from './whatsapp-provider.interface';
 import { InboundMessageProcessor } from './webhooks/inbound-message.processor';
+import { EvolutionWebhookController } from './webhooks/evolution.controller';
 import { WhatsappEventsListener } from './listeners/whatsapp-events.listener';
 import { WhatsappController } from './whatsapp.controller';
-import { WebhooksController } from './webhooks/webhooks.controller';
-import { PrismaModule } from '../../common/prisma/prisma.module';
 import { AutomationsModule } from '../automations/automations.module';
 import { QUEUE_NAMES } from '../../queue/queue.constants';
 
 @Module({
   imports: [
     ConfigModule,
-    PrismaModule,
     forwardRef(() => AutomationsModule),
     BullModule.registerQueue(
       { name: QUEUE_NAMES.INBOUND_MESSAGES },
       { name: QUEUE_NAMES.OUTBOUND_MESSAGES },
     ),
   ],
-  controllers: [WhatsappController, WebhooksController],
+  controllers: [WhatsappController, EvolutionWebhookController],
   providers: [
     WhatsappService,
     WhatsappPresenceService,

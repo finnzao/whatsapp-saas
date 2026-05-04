@@ -47,11 +47,7 @@ export class InboundMessageProcessor extends WorkerHost {
       create: { tenantId, phone: fromPhone, name: pushName ?? null },
     });
 
-    const conversation = await this.findOrCreateActiveConversation(
-      tenantId,
-      contact.id,
-      instanceName,
-    );
+    const conversation = await this.findOrCreateActiveConversation(tenantId, contact.id);
 
     const message = await this.prisma.message.create({
       data: {
@@ -59,9 +55,10 @@ export class InboundMessageProcessor extends WorkerHost {
         conversationId: conversation.id,
         contactId: contact.id,
         direction: 'INBOUND',
+        type: 'TEXT',
         content: text,
         externalId: externalMessageId,
-        status: 'RECEIVED',
+        status: 'DELIVERED',
         createdAt: new Date(timestamp),
       },
     });
@@ -87,11 +84,7 @@ export class InboundMessageProcessor extends WorkerHost {
     return { saved: true, debounced: true };
   }
 
-  private async findOrCreateActiveConversation(
-    tenantId: string,
-    contactId: string,
-    instanceName: string,
-  ) {
+  private async findOrCreateActiveConversation(tenantId: string, contactId: string) {
     const existing = await this.prisma.conversation.findFirst({
       where: {
         tenantId,
@@ -107,7 +100,6 @@ export class InboundMessageProcessor extends WorkerHost {
         tenantId,
         contactId,
         status: 'BOT',
-        instanceName,
       },
     });
   }

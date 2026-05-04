@@ -9,8 +9,10 @@ import { LlmProviderFactory } from './providers/llm-provider.factory';
 import { AnthropicProvider } from './providers/anthropic.provider';
 import { OllamaProvider } from './providers/ollama.provider';
 import { OpenAiCompatibleProvider } from './providers/openai-compatible.provider';
+import { EmbeddingsModule } from './embeddings/embeddings.module';
 
 @Module({
+  imports: [EmbeddingsModule],
   providers: [
     AiService,
     CatalogTools,
@@ -22,6 +24,6 @@ import { OpenAiCompatibleProvider } from './providers/openai-compatible.provider
     OllamaProvider,
     OpenAiCompatibleProvider,
   ],
-  exports: [AiService, IntentClassifier, MessageIntentClassifier],
+  exports: [AiService, IntentClassifier, MessageIntentClassifier, EmbeddingsModule],
 })
 export class AiModule {}

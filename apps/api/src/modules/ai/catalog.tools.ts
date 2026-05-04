@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Prisma, Product, ProductVariation } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { normalize, tokenize } from '../../common/utils/text-normalize';
+import { EmbeddingService } from './embeddings/embedding.service';
 
 type ProductWithRelations = Product & {
   category: { name: string } | null;
@@ -15,7 +16,7 @@ export interface ToolHandoffResult {
 
 export type ToolExecutionResult =
   | ToolHandoffResult
-  | { handoff?: false; [key: string]: unknown }
+  | { handoff?: false;[key: string]: unknown }
   | unknown[];
 
 const QUALIFIER_TOKENS = new Set([
@@ -97,10 +98,6 @@ const HEX_TO_COLOR_NAME: Array<{ hex: string; name: string }> = [
   { hex: '#a52a2a', name: 'marrom' },
 ];
 
-function tokenizeKeyword(kw: string): string[] {
-  return tokenize(kw);
-}
-
 function classifyToken(
   token: string,
   customTypeTokens: Set<string>,
@@ -113,21 +110,18 @@ function classifyToken(
 
 function productMatchesProductType(haystack: string, productTypeToken: string): boolean {
   if (haystack.includes(productTypeToken)) return true;
-
   const group = getProductTypeGroup(productTypeToken);
   if (group) {
     for (const synonym of group) {
       if (synonym !== productTypeToken && haystack.includes(synonym)) return true;
     }
   }
-
   const modelHints = GENERIC_TO_MODEL_HINTS[productTypeToken];
   if (modelHints) {
     for (const model of modelHints) {
       if (haystack.includes(model)) return true;
     }
   }
-
   return false;
 }
 
@@ -177,25 +171,49 @@ interface CategoryKeywordContext {
   hasAnyKeywords: boolean;
 }
 
+interface SearchContext {
+  conversationId?: string;
+  contactId?: string;
+}
+
+interface RankedProduct {
+  product: ProductWithRelations;
+  lexicalRank?: number;
+  vectorRank?: number;
+  vectorDistance?: number;
+  rrfScore: number;
+  matchedTokens: string[];
+  missedProductTypes: string[];
+  missedQualifiers: string[];
+  categoryActivated: boolean;
+}
+
+const RRF_K = 60;
+const VECTOR_LIMIT_DEFAULT = 30;
+const VECTOR_MAX_DISTANCE = 0.6; // descarta resultados claramente irrelevantes
+
 @Injectable()
 export class CatalogTools {
   private readonly logger = new Logger(CatalogTools.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly embeddings: EmbeddingService,
+  ) { }
 
   getToolDefinitions() {
     return [
       {
         name: 'search_products',
         description:
-          'USE SEMPRE QUE O CLIENTE PERGUNTAR SOBRE PRODUTOS. Busca no catálogo. Retorna matchQuality ("exact"/"partial"/"none") e priceDisplay já FORMATADO em reais — sempre use o priceDisplay literal ao responder, NUNCA recalcule.',
+          'USE SEMPRE QUE O CLIENTE PERGUNTAR SOBRE PRODUTOS. Busca no catálogo combinando palavras-chave e busca semântica (intenção). Retorna matchQuality ("exact"/"partial"/"none") e priceDisplay já FORMATADO em reais — sempre use o priceDisplay literal ao responder, NUNCA recalcule.',
         parameters: {
           type: 'object' as const,
           properties: {
             query: {
               type: 'string',
               description:
-                'Texto livre com as palavras do cliente, incluindo características (cor, tamanho, marca).',
+                'Texto livre com as palavras do cliente, incluindo características (cor, tamanho, marca) ou intenção (presente, uso, contexto).',
             },
             maxPrice: { type: 'number', description: 'Preço máximo em reais (opcional)' },
             minPrice: { type: 'number', description: 'Preço mínimo em reais (opcional)' },
@@ -256,39 +274,143 @@ export class CatalogTools {
       const kws = cat.keywords ?? [];
       if (kws.length === 0) continue;
       hasAnyKeywords = true;
-
       for (const kw of kws) {
-        const tokens = tokenizeKeyword(kw);
+        const tokens = tokenize(kw);
         for (const tok of tokens) {
           customTypeTokens.add(tok);
-          if (!tokenToCategoryNames.has(tok)) {
-            tokenToCategoryNames.set(tok, new Set());
-          }
+          if (!tokenToCategoryNames.has(tok)) tokenToCategoryNames.set(tok, new Set());
           tokenToCategoryNames.get(tok)!.add(cat.name);
         }
       }
     }
 
-    return {
-      customTypeTokens,
-      tokenToCategoryNames,
-      allCategoryNames,
-      hasAnyKeywords,
-    };
+    return { customTypeTokens, tokenToCategoryNames, allCategoryNames, hasAnyKeywords };
   }
 
+  /**
+   * Busca híbrida: lexical (atual) + vetorial (novo) + RRF.
+   *
+   * 1. Lexical retorna até 100 produtos com tokens batendo.
+   * 2. Vetorial retorna até 30 produtos por similaridade semântica (cosine).
+   * 3. RRF combina os dois rankings num score único.
+   * 4. Aplicamos as MESMAS regras de matchQuality (product type, qualifier
+   *    missing) como antes, mas operando sobre o conjunto fundido.
+   */
   async searchProducts(
     tenantId: string,
     params: { query: string; maxPrice?: number; minPrice?: number; limit?: number },
+    ctx: SearchContext = {},
   ) {
+    const startedAt = Date.now();
     const tokens = tokenize(params.query);
     const limit = params.limit ?? 5;
-
     const keywordCtx = await this.buildKeywordContext(tenantId);
 
+    const tokenTypes = tokens.map((t) => ({
+      token: t,
+      type: classifyToken(t, keywordCtx.customTypeTokens),
+    }));
+    const productTypeTokens = tokenTypes.filter((t) => t.type === 'product_type').map((t) => t.token);
+    const qualifierTokens = tokenTypes.filter((t) => t.type === 'qualifier').map((t) => t.token);
+
+    const activatedCategoryNames = new Set<string>();
+    for (const t of tokens) {
+      const cats = keywordCtx.tokenToCategoryNames.get(t);
+      if (cats) for (const c of cats) activatedCategoryNames.add(c);
+    }
+
+    const [lexicalRanked, vectorRanked] = await Promise.all([
+      this.lexicalSearch(tenantId, params, tokens, productTypeTokens, qualifierTokens, activatedCategoryNames, keywordCtx),
+      this.vectorSearchAndHydrate(tenantId, params),
+    ]);
+
+    const fused = this.fuseRankings(lexicalRanked, vectorRanked, tokens, productTypeTokens, qualifierTokens, activatedCategoryNames);
+
+    const { matchQuality, chosen } = this.decideMatchQuality(
+      fused,
+      productTypeTokens,
+      tokens,
+      keywordCtx,
+      limit,
+    );
+
+    const latencyMs = Date.now() - startedAt;
+
+    this.logger.debug(
+      `[search_products] q="${params.query}" tokens=[${tokens.join(',')}] ` +
+      `lex=${lexicalRanked.length} vec=${vectorRanked.length} fused=${fused.length} ` +
+      `quality=${matchQuality} returned=${chosen.length} ${latencyMs}ms`,
+    );
+
+    const resultsShown = chosen.map((x, i) => ({
+      productId: x.product.id,
+      name: x.product.name,
+      finalRank: i + 1,
+      lexicalRank: x.lexicalRank ?? null,
+      vectorRank: x.vectorRank ?? null,
+      vectorDistance: x.vectorDistance ?? null,
+      rrfScore: Number(x.rrfScore.toFixed(6)),
+    }));
+
+    void this.recordInteraction({
+      tenantId,
+      query: params.query,
+      tokens,
+      lexicalCount: lexicalRanked.length,
+      vectorCount: vectorRanked.length,
+      fusedCount: fused.length,
+      matchQuality,
+      resultsShown,
+      latencyMs,
+      ctx,
+    });
+
+    return {
+      matchQuality,
+      queryTokens: tokens,
+      totalCandidates: lexicalRanked.length + vectorRanked.length,
+      results: chosen.map((x) => ({
+        ...this.serializeProduct(x.product),
+        matchedOn: x.matchedTokens,
+        notMatched: x.missedQualifiers,
+      })),
+      ...(matchQuality === 'partial' && {
+        hint:
+          'IMPORTANTE: Estes produtos podem ter DIFERENÇAS do que o cliente pediu (veja "notMatched"). ' +
+          'Avise honestamente sobre a diferença antes de oferecer. Use priceDisplay LITERAL.',
+      }),
+      ...(matchQuality === 'none' &&
+        productTypeTokens.length > 0 && {
+        hint: this.buildNoneHint(keywordCtx, productTypeTokens),
+      }),
+      ...(matchQuality === 'none' &&
+        productTypeTokens.length === 0 && {
+        hint:
+          'Nenhum produto encontrado. Peça mais detalhes (marca, modelo, faixa de preço) ' +
+          'ou ofereça transferência para atendente.',
+      }),
+    };
+  }
+
+  // -----------------------------------------------------------
+  // LEXICAL SEARCH (lógica existente, refatorada)
+  // -----------------------------------------------------------
+  private async lexicalSearch(
+    tenantId: string,
+    params: { maxPrice?: number; minPrice?: number },
+    tokens: string[],
+    productTypeTokens: string[],
+    qualifierTokens: string[],
+    activatedCategoryNames: Set<string>,
+    keywordCtx: CategoryKeywordContext,
+  ): Promise<RankedProduct[]> {
     const priceFilter: Prisma.DecimalFilter = {};
-    if (params.maxPrice !== undefined) priceFilter.lte = params.maxPrice;
-    if (params.minPrice !== undefined) priceFilter.gte = params.minPrice;
+    if (typeof params.maxPrice === 'number' && Number.isFinite(params.maxPrice)) {
+      priceFilter.lte = params.maxPrice;
+    }
+    if (typeof params.minPrice === 'number' && Number.isFinite(params.minPrice)) {
+      priceFilter.gte = params.minPrice;
+    }
 
     const where: Prisma.ProductWhereInput = {
       tenantId,
@@ -307,40 +429,12 @@ export class CatalogTools {
       take: 100,
     });
 
-    if (tokens.length === 0) {
-      return {
-        matchQuality: 'none' as const,
-        queryTokens: tokens,
-        totalCandidates: candidates.length,
-        results: [],
-        hint: 'Query sem termos específicos. Peça ao cliente nome/marca/categoria do produto.',
-      };
-    }
-
-    const tokenTypes = tokens.map((t) => ({
-      token: t,
-      type: classifyToken(t, keywordCtx.customTypeTokens),
-    }));
-    const productTypeTokens = tokenTypes
-      .filter((t) => t.type === 'product_type')
-      .map((t) => t.token);
-    const qualifierTokens = tokenTypes
-      .filter((t) => t.type === 'qualifier')
-      .map((t) => t.token);
-
-    const activatedCategoryNames = new Set<string>();
-    for (const t of tokens) {
-      const cats = keywordCtx.tokenToCategoryNames.get(t);
-      if (cats) {
-        for (const c of cats) activatedCategoryNames.add(c);
-      }
-    }
+    if (tokens.length === 0) return [];
 
     const scored = candidates
       .map((p) => {
         const haystack = this.buildHaystack(p);
         const matchedTokens = tokens.filter((t) => haystack.includes(t));
-
         const matchedProductTypes = productTypeTokens.filter((t) =>
           productMatchesProductType(haystack, t),
         );
@@ -351,14 +445,13 @@ export class CatalogTools {
 
         const productCategoryName = p.category?.name;
         const categoryActivated =
-          productCategoryName !== undefined &&
-          activatedCategoryNames.has(productCategoryName);
+          productCategoryName !== undefined && activatedCategoryNames.has(productCategoryName);
 
         const effectiveMatched = Array.from(
           new Set([...matchedTokens, ...matchedProductTypes]),
         );
 
-        const score = this.computeScore(
+        const score = this.computeLexicalScore(
           p,
           tokens,
           effectiveMatched,
@@ -378,9 +471,144 @@ export class CatalogTools {
       .filter((x) => x.matchedTokens.length > 0 || x.categoryActivated)
       .sort((a, b) => b.score - a.score);
 
-    let matchQuality: 'exact' | 'partial' | 'none';
-    let chosen: typeof scored;
+    return scored.map((s, i) => ({
+      product: s.product,
+      lexicalRank: i + 1,
+      rrfScore: 0,
+      matchedTokens: s.matchedTokens,
+      missedProductTypes: s.missedProductTypes,
+      missedQualifiers: s.missedQualifiers,
+      categoryActivated: s.categoryActivated,
+    }));
+  }
 
+  // -----------------------------------------------------------
+  // VECTOR SEARCH
+  // -----------------------------------------------------------
+  private async vectorSearchAndHydrate(
+    tenantId: string,
+    params: { query: string; maxPrice?: number; minPrice?: number },
+  ): Promise<Array<{ product: ProductWithRelations; rank: number; distance: number }>> {
+    if (!params.query?.trim()) return [];
+
+    let queryVector: number[];
+    try {
+      queryVector = await this.embeddings.embedQuery(params.query);
+    } catch (err) {
+      this.logger.warn(
+        `[search_products] embedding falhou (degradando pra só lexical): ${(err as Error).message}`,
+      );
+      return [];
+    }
+
+    const ranked = await this.embeddings.vectorSearch(tenantId, queryVector, {
+      limit: VECTOR_LIMIT_DEFAULT,
+      minDistance: VECTOR_MAX_DISTANCE,
+    });
+    if (ranked.length === 0) return [];
+
+    const hasMaxPrice = typeof params.maxPrice === 'number' && Number.isFinite(params.maxPrice);
+    const hasMinPrice = typeof params.minPrice === 'number' && Number.isFinite(params.minPrice);
+    const priceWhere: Prisma.DecimalFilter = {};
+    if (hasMaxPrice) priceWhere.lte = params.maxPrice;
+    if (hasMinPrice) priceWhere.gte = params.minPrice;
+
+    const products = await this.prisma.product.findMany({
+      where: {
+        id: { in: ranked.map((r) => r.id) },
+        tenantId,
+        active: true,
+        paused: false,
+        ...(Object.keys(priceWhere).length > 0 && { price: priceWhere }),
+      },
+      include: {
+        category: { select: { name: true } },
+        variations: { where: { active: true } },
+      },
+    });
+
+    const byId = new Map(products.map((p) => [p.id, p]));
+
+    return ranked
+      .map((r, i) => {
+        const product = byId.get(r.id);
+        if (!product) return null;
+        return { product, rank: i + 1, distance: r.distance };
+      })
+      .filter((x): x is { product: ProductWithRelations; rank: number; distance: number } => x !== null);
+  }
+
+  // -----------------------------------------------------------
+  // RRF (Reciprocal Rank Fusion)
+  // -----------------------------------------------------------
+  private fuseRankings(
+    lexical: RankedProduct[],
+    vector: Array<{ product: ProductWithRelations; rank: number; distance: number }>,
+    tokens: string[],
+    productTypeTokens: string[],
+    qualifierTokens: string[],
+    activatedCategoryNames: Set<string>,
+  ): RankedProduct[] {
+    const merged = new Map<string, RankedProduct>();
+
+    for (const l of lexical) {
+      merged.set(l.product.id, {
+        ...l,
+        rrfScore: 1 / (RRF_K + (l.lexicalRank ?? 1)),
+      });
+    }
+
+    for (const v of vector) {
+      const existing = merged.get(v.product.id);
+      const vectorContribution = 1 / (RRF_K + v.rank);
+
+      if (existing) {
+        existing.vectorRank = v.rank;
+        existing.vectorDistance = v.distance;
+        existing.rrfScore += vectorContribution;
+      } else {
+        // Produto vindo só do vetor — calcular metadados de match.
+        const haystack = this.buildHaystack(v.product);
+        const matchedTokens = tokens.filter((t) => haystack.includes(t));
+        const matchedProductTypes = productTypeTokens.filter((t) =>
+          productMatchesProductType(haystack, t),
+        );
+        const missedProductTypes = productTypeTokens.filter(
+          (t) => !productMatchesProductType(haystack, t),
+        );
+        const missedQualifiers = qualifierTokens.filter((t) => !matchedTokens.includes(t));
+        const categoryActivated =
+          v.product.category?.name !== undefined &&
+          activatedCategoryNames.has(v.product.category.name);
+        const effectiveMatched = Array.from(new Set([...matchedTokens, ...matchedProductTypes]));
+
+        merged.set(v.product.id, {
+          product: v.product,
+          vectorRank: v.rank,
+          vectorDistance: v.distance,
+          rrfScore: vectorContribution,
+          matchedTokens: effectiveMatched,
+          missedProductTypes,
+          missedQualifiers,
+          categoryActivated,
+        });
+      }
+    }
+
+    return Array.from(merged.values()).sort((a, b) => b.rrfScore - a.rrfScore);
+  }
+
+  // -----------------------------------------------------------
+  // matchQuality decisão (mesma regra do código antigo, mas agora
+  // sobre o conjunto fundido)
+  // -----------------------------------------------------------
+  private decideMatchQuality(
+    scored: RankedProduct[],
+    productTypeTokens: string[],
+    tokens: string[],
+    keywordCtx: CategoryKeywordContext,
+    limit: number,
+  ): { matchQuality: 'exact' | 'partial' | 'none'; chosen: RankedProduct[] } {
     const hasProductTypeRequirement = productTypeTokens.length > 0;
 
     const productsWithRequiredType = scored.filter((x) => {
@@ -395,60 +623,22 @@ export class CatalogTools {
     });
 
     if (hasProductTypeRequirement && productsWithRequiredType.length === 0) {
-      matchQuality = 'none';
-      chosen = [];
-    } else {
-      const candidatesForChoice = hasProductTypeRequirement ? productsWithRequiredType : scored;
-      const exactMatches = candidatesForChoice.filter(
-        (x) => x.matchedTokens.length === tokens.length,
-      );
-
-      if (exactMatches.length > 0) {
-        matchQuality = 'exact';
-        chosen = exactMatches.slice(0, limit);
-      } else if (candidatesForChoice.length > 0) {
-        matchQuality = 'partial';
-        chosen = candidatesForChoice.slice(0, limit);
-      } else {
-        matchQuality = 'none';
-        chosen = [];
-      }
+      return { matchQuality: 'none', chosen: [] };
     }
 
-    this.logger.debug(
-      `[search_products] query="${params.query}" tokens=[${tokens.join(', ')}] ` +
-        `productType=[${productTypeTokens.join(', ')}] qualifiers=[${qualifierTokens.join(', ')}] ` +
-        `activatedCategories=[${Array.from(activatedCategoryNames).join(', ')}] ` +
-        `candidates=${candidates.length} scored=${scored.length} ` +
-        `matchQuality=${matchQuality} returned=${chosen.length}`,
+    const candidatesForChoice = hasProductTypeRequirement ? productsWithRequiredType : scored;
+
+    const exactMatches = candidatesForChoice.filter(
+      (x) => x.matchedTokens.length === tokens.length && tokens.length > 0,
     );
 
-    return {
-      matchQuality,
-      queryTokens: tokens,
-      totalCandidates: candidates.length,
-      results: chosen.map((x) => ({
-        ...this.serializeProduct(x.product),
-        matchedOn: x.matchedTokens,
-        notMatched: x.missedQualifiers,
-      })),
-      ...(matchQuality === 'partial' && {
-        hint:
-          'IMPORTANTE: Estes produtos são do tipo certo mas têm DIFERENÇAS do que o cliente pediu ' +
-          '(veja "notMatched" de cada). Avise honestamente sobre a diferença antes de oferecer. ' +
-          'Use priceDisplay LITERAL.',
-      }),
-      ...(matchQuality === 'none' &&
-        hasProductTypeRequirement && {
-          hint: this.buildNoneHint(keywordCtx, productTypeTokens),
-        }),
-      ...(matchQuality === 'none' &&
-        !hasProductTypeRequirement && {
-          hint:
-            'Nenhum produto encontrado. Peça mais detalhes (marca, modelo, faixa de preço) ' +
-            'ou ofereça transferência para atendente.',
-        }),
-    };
+    if (exactMatches.length > 0) {
+      return { matchQuality: 'exact', chosen: exactMatches.slice(0, limit) };
+    }
+    if (candidatesForChoice.length > 0) {
+      return { matchQuality: 'partial', chosen: candidatesForChoice.slice(0, limit) };
+    }
+    return { matchQuality: 'none', chosen: [] };
   }
 
   private buildNoneHint(ctx: CategoryKeywordContext, productTypeTokens: string[]): string {
@@ -457,7 +647,6 @@ export class CatalogTools {
       ctx.allCategoryNames.length > 0
         ? `Esta loja vende: ${ctx.allCategoryNames.join(', ')}.`
         : 'Esta loja ainda não tem categorias cadastradas.';
-
     return (
       `O cliente pediu produto do tipo "${requested}" e a loja NÃO TEM esse tipo. ` +
       `${sells} ` +
@@ -467,9 +656,66 @@ export class CatalogTools {
     );
   }
 
+  // -----------------------------------------------------------
+  // SearchInteraction persistence
+  // -----------------------------------------------------------
+  private async recordInteraction(args: {
+    tenantId: string;
+    query: string;
+    tokens: string[];
+    lexicalCount: number;
+    vectorCount: number;
+    fusedCount: number;
+    matchQuality: string;
+    resultsShown: unknown[];
+    latencyMs: number;
+    ctx: SearchContext;
+  }): Promise<void> {
+    try {
+      // Embedda a query (de novo, mas geralmente vai cair no cache do provider).
+      // Falhas aqui não bloqueiam — gravamos sem vector.
+      let queryVectorLiteral: string | null = null;
+      try {
+        const v = await this.embeddings.embedQuery(args.query);
+        queryVectorLiteral = `[${v.map((n) => (Number.isFinite(n) ? n : 0)).join(',')}]`;
+      } catch {
+        // segue sem queryEmbedding
+      }
+
+      await this.prisma.$executeRaw`
+        INSERT INTO "search_interactions" (
+          "id", "tenantId", "conversationId", "contactId",
+          "query", "queryNormalized", "queryEmbedding",
+          "resultsShown", "lexicalCount", "vectorCount", "fusedCount",
+          "matchQuality", "outcome", "latencyMs"
+        ) VALUES (
+          gen_random_uuid(),
+          ${args.tenantId},
+          ${args.ctx.conversationId ?? null},
+          ${args.ctx.contactId ?? null},
+          ${args.query},
+          ${args.tokens.join(' ')},
+          ${queryVectorLiteral ? Prisma.sql`${queryVectorLiteral}::vector` : null},
+          ${JSON.stringify(args.resultsShown)}::jsonb,
+          ${args.lexicalCount},
+          ${args.vectorCount},
+          ${args.fusedCount},
+          ${args.matchQuality},
+          ${args.matchQuality === 'none' ? 'no_results' : null},
+          ${args.latencyMs}
+        )
+      `;
+    } catch (err) {
+      this.logger.warn(`[search_products] falha ao gravar interaction: ${(err as Error).message}`);
+    }
+  }
+
+  // -----------------------------------------------------------
+  // Resto: serialização, lookup, etc — sem mudança lógica
+  // -----------------------------------------------------------
+
   private buildHaystack(p: ProductWithRelations): string {
     const parts: string[] = [p.name, p.description ?? '', p.sku ?? '', p.category?.name ?? ''];
-
     const cf = p.customFields as Record<string, unknown> | null;
     if (cf) {
       for (const value of Object.values(cf)) {
@@ -480,15 +726,11 @@ export class CatalogTools {
         }
       }
     }
-
     for (const v of p.variations) {
       parts.push(v.name);
       const attrs = v.attributes as Record<string, unknown> | null;
-      if (attrs) {
-        parts.push(Object.values(attrs).map((x) => this.stringifyFieldValue(x)).join(' '));
-      }
+      if (attrs) parts.push(Object.values(attrs).map((x) => this.stringifyFieldValue(x)).join(' '));
     }
-
     return normalize(parts.join(' '));
   }
 
@@ -501,7 +743,7 @@ export class CatalogTools {
     return s;
   }
 
-  private computeScore(
+  private computeLexicalScore(
     p: ProductWithRelations,
     tokens: string[],
     matched: string[],
@@ -510,14 +752,11 @@ export class CatalogTools {
   ): number {
     const nameNorm = normalize(p.name);
     const nameMatches = tokens.filter((t) => nameNorm.includes(t)).length;
-
     let score = matched.length * 10 + nameMatches * 20;
     score += matchedProductTypes.length * 50;
     if (categoryActivated) score += 25;
-
     if (p.stock > 0) score += 5;
     if (tokens.every((t) => nameNorm.includes(t))) score += 30;
-
     return score;
   }
 
@@ -529,37 +768,24 @@ export class CatalogTools {
   } {
     const priceDisplay = formatBrl(p.price) ?? 'a consultar';
     const priceCashDisplay = p.priceCash !== null ? formatBrl(p.priceCash) : null;
-
     let installmentsDisplay: string | null = null;
     if (p.installments && p.installments > 0 && p.priceInstallment !== null) {
       const perInstallment = Number(p.priceInstallment) / p.installments;
       const perInstallmentStr = formatBrl(perInstallment);
-      if (perInstallmentStr) {
-        installmentsDisplay = `${p.installments}x de ${perInstallmentStr}`;
-      }
+      if (perInstallmentStr) installmentsDisplay = `${p.installments}x de ${perInstallmentStr}`;
     }
-
     const extras: string[] = [];
-    if (priceCashDisplay && priceCashDisplay !== priceDisplay) {
-      extras.push(`${priceCashDisplay} à vista`);
-    }
+    if (priceCashDisplay && priceCashDisplay !== priceDisplay) extras.push(`${priceCashDisplay} à vista`);
     if (installmentsDisplay) extras.push(installmentsDisplay);
     const fullPriceText =
       extras.length > 0 ? `${priceDisplay} (ou ${extras.join(', ou ')})` : priceDisplay;
-
-    return {
-      priceDisplay,
-      priceCashDisplay,
-      installmentsDisplay,
-      fullPriceText,
-    };
+    return { priceDisplay, priceCashDisplay, installmentsDisplay, fullPriceText };
   }
 
   private serializeProduct(p: ProductWithRelations) {
     const cf = p.customFields as Record<string, unknown> | null;
     const enrichedCf = cf ? this.enrichCustomFieldsForDisplay(cf) : null;
     const priceInfo = this.buildPriceInfo(p);
-
     return {
       id: p.id,
       name: p.name,
@@ -569,9 +795,7 @@ export class CatalogTools {
       installmentsDisplay: priceInfo.installmentsDisplay,
       fullPriceText: priceInfo.fullPriceText,
       stockText: p.trackStock
-        ? p.stock > 0
-          ? `${p.stock} em estoque`
-          : 'sem estoque'
+        ? p.stock > 0 ? `${p.stock} em estoque` : 'sem estoque'
         : 'disponível',
       price: Number(p.price),
       stock: p.stock,
@@ -607,7 +831,7 @@ export class CatalogTools {
     return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
   }
 
-  async checkProductAvailability(tenantId: string, productId: string) {
+  async checkProductAvailability(tenantId: string, productId: string, ctx: SearchContext = {}) {
     if (!this.isUuid(productId)) {
       this.logger.warn(
         `[check_product_availability] productId inválido: "${productId}". Modelo deveria usar search_products primeiro.`,
@@ -629,9 +853,14 @@ export class CatalogTools {
 
     if (!product) return { found: false };
 
+    // Heurística leve: marca a interaction mais recente como "asked_more" se
+    // o produto consultado foi um dos mostrados.
+    if (ctx.conversationId) {
+      void this.markFollowUp(ctx.conversationId, productId);
+    }
+
     const cf = product.customFields as Record<string, unknown> | null;
     const priceInfo = this.buildPriceInfo(product as ProductWithRelations);
-
     return {
       found: true,
       name: product.name,
@@ -641,9 +870,7 @@ export class CatalogTools {
       fullPriceText: priceInfo.fullPriceText,
       available: product.active && !product.paused && (!product.trackStock || product.stock > 0),
       stockText: product.trackStock
-        ? product.stock > 0
-          ? `${product.stock} em estoque`
-          : 'sem estoque'
+        ? product.stock > 0 ? `${product.stock} em estoque` : 'sem estoque'
         : 'disponível',
       customFields: cf ? this.enrichCustomFieldsForDisplay(cf) : null,
     };
@@ -657,18 +884,50 @@ export class CatalogTools {
     });
   }
 
-  async execute(tenantId: string, toolName: string, input: any): Promise<ToolExecutionResult> {
+  async execute(
+    tenantId: string,
+    toolName: string,
+    input: any,
+    ctx: SearchContext = {},
+  ): Promise<ToolExecutionResult> {
     switch (toolName) {
       case 'search_products':
-        return this.searchProducts(tenantId, input);
+        return this.searchProducts(tenantId, input, ctx);
       case 'check_product_availability':
-        return this.checkProductAvailability(tenantId, input.productId);
+        return this.checkProductAvailability(tenantId, input.productId, ctx);
       case 'list_categories':
         return this.listCategories(tenantId);
       case 'request_human_handoff':
         return { handoff: true, reason: input.reason } as ToolHandoffResult;
       default:
         return { error: `Tool desconhecida: ${toolName}` };
+    }
+  }
+
+  /**
+   * Marca as interactions recentes como 'asked_more' quando o produto
+   * mostrado é consultado (check_product_availability). É um sinal
+   * positivo pra training data — o cliente quis saber detalhes.
+   */
+  private async markFollowUp(conversationId: string, productId: string): Promise<void> {
+    try {
+      await this.prisma.$executeRaw`
+        UPDATE "search_interactions"
+        SET "outcome" = 'asked_more',
+            "outcomeAt" = NOW(),
+            "selectedProductId" = ${productId}
+        WHERE "id" IN (
+          SELECT "id" FROM "search_interactions"
+          WHERE "conversationId" = ${conversationId}
+            AND "outcome" IS NULL
+            AND "createdAt" > NOW() - INTERVAL '10 minutes'
+            AND "resultsShown" @> ${JSON.stringify([{ productId }])}::jsonb
+          ORDER BY "createdAt" DESC
+          LIMIT 1
+        )
+      `;
+    } catch (err) {
+      this.logger.debug(`[catalog] markFollowUp falhou: ${(err as Error).message}`);
     }
   }
 }

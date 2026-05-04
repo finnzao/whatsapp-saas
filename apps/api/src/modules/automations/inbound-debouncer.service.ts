@@ -32,6 +32,10 @@ const STATE_KEY_PREFIX = 'debounce:state:';
 const MSGS_KEY_PREFIX = 'debounce:msgs:';
 const LOCK_KEY_PREFIX = 'debounce:lock:';
 
+function buildJobId(conversationId: string): string {
+  return `debounce-${conversationId}`;
+}
+
 @Injectable()
 export class InboundDebouncerService {
   private readonly logger = new Logger(InboundDebouncerService.name);
@@ -157,7 +161,7 @@ export class InboundDebouncerService {
   }
 
   private async scheduleJob(conversationId: string, delayMs: number): Promise<void> {
-    const jobId = `debounce:${conversationId}`;
+    const jobId = buildJobId(conversationId);
 
     try {
       await this.queue.remove(jobId);

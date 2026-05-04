@@ -1,10 +1,12 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
 }
 
 model Tenant {
@@ -28,6 +30,7 @@ model Tenant {
   faqs                   Faq[]
   automationRules        AutomationRule[]
   customFieldDefinitions CustomFieldDefinition[]
+  searchInteractions     SearchInteraction[]
 
   @@map("tenants")
 }
@@ -118,10 +121,11 @@ model Contact {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  conversations Conversation[]
-  messages      Message[]
-  orders        Order[]
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversations      Conversation[]
+  messages           Message[]
+  orders             Order[]
+  searchInteractions SearchInteraction[]
 
   @@unique([tenantId, phone])
   @@index([tenantId])
@@ -141,11 +145,12 @@ model Conversation {
   createdAt      DateTime           @default(now())
   updatedAt      DateTime           @updatedAt
 
-  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  contact      Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
-  assignedUser User?     @relation("AssignedUser", fields: [assignedUserId], references: [id])
-  messages     Message[]
-  orders       Order[]
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact            Contact             @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  assignedUser       User?               @relation("AssignedUser", fields: [assignedUserId], references: [id])
+  messages           Message[]
+  orders             Order[]
+  searchInteractions SearchInteraction[]
 
   @@index([tenantId, status])
   @@index([tenantId, lastMessageAt])
@@ -255,10 +260,15 @@ model Product {
   createdAt        DateTime         @default(now())
   updatedAt        DateTime         @updatedAt
 
-  tenant     Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  category   Category?          @relation(fields: [categoryId], references: [id])
-  variations ProductVariation[]
-  orderItems OrderItem[]
+  embedding           Unsupported("vector(1024)")?
+  embeddingUpdatedAt  DateTime?
+  embeddingSourceHash String?
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category           Category?           @relation(fields: [categoryId], references: [id])
+  variations         ProductVariation[]
+  orderItems         OrderItem[]
+  searchInteractions SearchInteraction[]
 
   @@index([tenantId, active, paused])
   @@index([tenantId, categoryId])
@@ -419,4 +429,43 @@ model AutomationRule {
 
   @@index([tenantId, active])
   @@map("automation_rules")
+}
+
+// =============================================================
+// Round 4 — RAG vetorial e coleta de training data
+// =============================================================
+model SearchInteraction {
+  id              String  @id @default(uuid())
+  tenantId        String
+  conversationId  String?
+  contactId       String?
+
+  query           String
+  queryNormalized String
+  queryEmbedding  Unsupported("vector(1024)")?
+
+  resultsShown  Json
+  lexicalCount  Int    @default(0)
+  vectorCount   Int    @default(0)
+  fusedCount    Int    @default(0)
+
+  matchQuality String
+
+  selectedProductId String?
+  outcome           String?
+  outcomeAt         DateTime?
+
+  latencyMs Int?
+
+  createdAt DateTime @default(now())
+
+  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversation    Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  contact         Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  selectedProduct Product?      @relation(fields: [selectedProductId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, outcome])
+  @@index([conversationId])
+  @@map("search_interactions")
 }

@@ -7,14 +7,26 @@ import {
   ListProductsQueryDto,
 } from './dto/product.dto';
 import { CustomFieldsService } from '../custom-fields/custom-fields.module';
+import { EmbeddingService } from '../../ai/embeddings/embedding.service';
 
 const PRODUCT_ENTITY = 'product';
+
+const EMBEDDING_RELEVANT_FIELDS: ReadonlyArray<keyof UpdateProductDto> = [
+  'name',
+  'description',
+  'sku',
+  'categoryId',
+  'condition',
+  'warranty',
+  'customFields',
+];
 
 @Injectable()
 export class ProductsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly customFields: CustomFieldsService,
+    private readonly embeddings: EmbeddingService,
   ) {}
 
   async list(tenantId: string, query: ListProductsQueryDto) {
@@ -48,12 +60,7 @@ export class ProductsService {
 
     return {
       items,
-      pagination: {
-        page,
-        pageSize,
-        total,
-        totalPages: Math.ceil(total / pageSize),
-      },
+      pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
     };
   }
 
@@ -76,7 +83,7 @@ export class ProductsService {
       dto.customFields,
     );
 
-    return this.prisma.product.create({
+    const product = await this.prisma.product.create({
       data: {
         tenantId,
         name: dto.name,
@@ -97,6 +104,9 @@ export class ProductsService {
         customFields: customFields ?? Prisma.JsonNull,
       },
     });
+
+    await this.embeddings.enqueueProductEmbedding(product.id);
+    return product;
   }
 
   async update(tenantId: string, id: string, dto: UpdateProductDto) {
@@ -137,7 +147,15 @@ export class ProductsService {
       data.customFields = customFields ?? Prisma.JsonNull;
     }
 
-    return this.prisma.product.update({ where: { id }, data });
+    const updated = await this.prisma.product.update({ where: { id }, data });
+
+    // Só re-embedda se algo relevante mudou. Preço/estoque/active/paused não mexem
+    // no embedding — produto continua significando a mesma coisa semanticamente.
+    if (this.shouldReembedAfter(dto)) {
+      await this.embeddings.enqueueProductEmbedding(id);
+    }
+
+    return updated;
   }
 
   async remove(tenantId: string, id: string) {
@@ -163,5 +181,9 @@ export class ProductsService {
         ...(delta < 0 && { paused: { set: false } }),
       },
     });
+  }
+
+  private shouldReembedAfter(dto: UpdateProductDto): boolean {
+    return EMBEDDING_RELEVANT_FIELDS.some((field) => dto[field] !== undefined);
   }
 }

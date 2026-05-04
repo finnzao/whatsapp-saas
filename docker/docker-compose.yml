@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: wpp_postgres
     restart: unless-stopped
     environment:
@@ -16,7 +16,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
   redis:
     image: redis:7-alpine
     container_name: wpp_redis
@@ -31,7 +30,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
   evolution:
     image: atendai/evolution-api:v2.1.1
     container_name: wpp_evolution
@@ -73,7 +71,6 @@ services:
       - evolution_instances:/evolution/instances
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
 volumes:
   postgres_data:
   redis_data:
