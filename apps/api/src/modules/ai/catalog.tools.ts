@@ -190,7 +190,7 @@ interface RankedProduct {
 
 const RRF_K = 60;
 const VECTOR_LIMIT_DEFAULT = 30;
-const VECTOR_MAX_DISTANCE = 0.6; // descarta resultados claramente irrelevantes
+const VECTOR_MAX_DISTANCE = 0.45;
 
 @Injectable()
 export class CatalogTools {
@@ -287,15 +287,6 @@ export class CatalogTools {
     return { customTypeTokens, tokenToCategoryNames, allCategoryNames, hasAnyKeywords };
   }
 
-  /**
-   * Busca híbrida: lexical (atual) + vetorial (novo) + RRF.
-   *
-   * 1. Lexical retorna até 100 produtos com tokens batendo.
-   * 2. Vetorial retorna até 30 produtos por similaridade semântica (cosine).
-   * 3. RRF combina os dois rankings num score único.
-   * 4. Aplicamos as MESMAS regras de matchQuality (product type, qualifier
-   *    missing) como antes, mas operando sobre o conjunto fundido.
-   */
   async searchProducts(
     tenantId: string,
     params: { query: string; maxPrice?: number; minPrice?: number; limit?: number },
@@ -385,16 +376,11 @@ export class CatalogTools {
       }),
       ...(matchQuality === 'none' &&
         productTypeTokens.length === 0 && {
-        hint:
-          'Nenhum produto encontrado. Peça mais detalhes (marca, modelo, faixa de preço) ' +
-          'ou ofereça transferência para atendente.',
+        hint: this.buildAbstractNoneHint(keywordCtx, params.query),
       }),
     };
   }
 
-  // -----------------------------------------------------------
-  // LEXICAL SEARCH (lógica existente, refatorada)
-  // -----------------------------------------------------------
   private async lexicalSearch(
     tenantId: string,
     params: { maxPrice?: number; minPrice?: number },
@@ -482,9 +468,6 @@ export class CatalogTools {
     }));
   }
 
-  // -----------------------------------------------------------
-  // VECTOR SEARCH
-  // -----------------------------------------------------------
   private async vectorSearchAndHydrate(
     tenantId: string,
     params: { query: string; maxPrice?: number; minPrice?: number },
@@ -538,9 +521,6 @@ export class CatalogTools {
       .filter((x): x is { product: ProductWithRelations; rank: number; distance: number } => x !== null);
   }
 
-  // -----------------------------------------------------------
-  // RRF (Reciprocal Rank Fusion)
-  // -----------------------------------------------------------
   private fuseRankings(
     lexical: RankedProduct[],
     vector: Array<{ product: ProductWithRelations; rank: number; distance: number }>,
@@ -567,7 +547,6 @@ export class CatalogTools {
         existing.vectorDistance = v.distance;
         existing.rrfScore += vectorContribution;
       } else {
-        // Produto vindo só do vetor — calcular metadados de match.
         const haystack = this.buildHaystack(v.product);
         const matchedTokens = tokens.filter((t) => haystack.includes(t));
         const matchedProductTypes = productTypeTokens.filter((t) =>
@@ -598,10 +577,6 @@ export class CatalogTools {
     return Array.from(merged.values()).sort((a, b) => b.rrfScore - a.rrfScore);
   }
 
-  // -----------------------------------------------------------
-  // matchQuality decisão (mesma regra do código antigo, mas agora
-  // sobre o conjunto fundido)
-  // -----------------------------------------------------------
   private decideMatchQuality(
     scored: RankedProduct[],
     productTypeTokens: string[],
@@ -626,7 +601,16 @@ export class CatalogTools {
       return { matchQuality: 'none', chosen: [] };
     }
 
-    const candidatesForChoice = hasProductTypeRequirement ? productsWithRequiredType : scored;
+    let candidatesForChoice = hasProductTypeRequirement ? productsWithRequiredType : scored;
+
+    if (!hasProductTypeRequirement && tokens.length > 0) {
+      candidatesForChoice = candidatesForChoice.filter(
+        (x) => x.matchedTokens.length > 0 || x.categoryActivated,
+      );
+      if (candidatesForChoice.length === 0) {
+        return { matchQuality: 'none', chosen: [] };
+      }
+    }
 
     const exactMatches = candidatesForChoice.filter(
       (x) => x.matchedTokens.length === tokens.length && tokens.length > 0,
@@ -656,9 +640,20 @@ export class CatalogTools {
     );
   }
 
-  // -----------------------------------------------------------
-  // SearchInteraction persistence
-  // -----------------------------------------------------------
+  private buildAbstractNoneHint(ctx: CategoryKeywordContext, originalQuery: string): string {
+    const sells =
+      ctx.allCategoryNames.length > 0
+        ? `Esta loja vende: ${ctx.allCategoryNames.join(', ')}.`
+        : 'Esta loja ainda não tem categorias cadastradas.';
+    return (
+      `Cliente fez uma pergunta abstrata ("${originalQuery}") e nada do catálogo bateu. ` +
+      `${sells} ` +
+      'NÃO invente produtos de categorias que não estão acima. ' +
+      'Diga honestamente o que a loja vende e pergunte se algo dessas categorias serve. ' +
+      'Se não fizer sentido, ofereça transferência para atendente humano.'
+    );
+  }
+
   private async recordInteraction(args: {
     tenantId: string;
     query: string;
@@ -672,8 +667,6 @@ export class CatalogTools {
     ctx: SearchContext;
   }): Promise<void> {
     try {
-      // Embedda a query (de novo, mas geralmente vai cair no cache do provider).
-      // Falhas aqui não bloqueiam — gravamos sem vector.
       let queryVectorLiteral: string | null = null;
       try {
         const v = await this.embeddings.embedQuery(args.query);
@@ -709,10 +702,6 @@ export class CatalogTools {
       this.logger.warn(`[search_products] falha ao gravar interaction: ${(err as Error).message}`);
     }
   }
-
-  // -----------------------------------------------------------
-  // Resto: serialização, lookup, etc — sem mudança lógica
-  // -----------------------------------------------------------
 
   private buildHaystack(p: ProductWithRelations): string {
     const parts: string[] = [p.name, p.description ?? '', p.sku ?? '', p.category?.name ?? ''];
@@ -853,8 +842,6 @@ export class CatalogTools {
 
     if (!product) return { found: false };
 
-    // Heurística leve: marca a interaction mais recente como "asked_more" se
-    // o produto consultado foi um dos mostrados.
     if (ctx.conversationId) {
       void this.markFollowUp(ctx.conversationId, productId);
     }
@@ -904,11 +891,6 @@ export class CatalogTools {
     }
   }
 
-  /**
-   * Marca as interactions recentes como 'asked_more' quando o produto
-   * mostrado é consultado (check_product_availability). É um sinal
-   * positivo pra training data — o cliente quis saber detalhes.
-   */
   private async markFollowUp(conversationId: string, productId: string): Promise<void> {
     try {
       await this.prisma.$executeRaw`

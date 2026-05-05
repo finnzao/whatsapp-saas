@@ -21,6 +21,7 @@ import type { MessageIntent } from './message-intent-classifier.service';
 interface GenerateReplyParams {
   tenantId: string;
   conversationId: string;
+  contactId?: string;
   userMessage: string;
   instructions?: string;
   intent?: MessageIntent;
@@ -65,6 +66,11 @@ class TinyLruCache<V> {
   }
 }
 
+interface CategoriesCacheEntry {
+  text: string;
+  expiresAt: number;
+}
+
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
@@ -74,6 +80,8 @@ export class AiService {
   private readonly maxTokensPerCall: number;
   private readonly maxIterations: number;
   private readonly replyCache = new TinyLruCache<string>(200);
+  private readonly categoriesCache = new Map<string, CategoriesCacheEntry>();
+  private readonly categoriesCacheTtlMs = 60_000;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -101,7 +109,8 @@ export class AiService {
     }
 
     const history = await this.buildMessageHistory(params.conversationId);
-    const systemPrompt = this.buildSystemPrompt(params.instructions);
+    const categoriesText = await this.buildCategoriesContext(params.tenantId);
+    const systemPrompt = this.buildSystemPrompt(categoriesText, params.instructions);
 
     const messages: LlmMessage[] = [
       ...history,
@@ -138,7 +147,7 @@ export class AiService {
               messages,
               tools: this.provider.supportsToolCalling() ? toolDefinitions : undefined,
               maxTokens: this.maxTokensPerCall,
-              temperature: 0.3,
+              temperature: 0.2,
               ...(i === 0 && forceTool && this.provider.supportsToolCalling()
                 ? { toolChoice: 'any' as const }
                 : {}),
@@ -192,7 +201,10 @@ export class AiService {
 
       for (const toolCall of response.toolCalls) {
         const { value: result, durationMs } = await timed(() =>
-          this.tools.execute(params.tenantId, toolCall.name, toolCall.input),
+          this.tools.execute(params.tenantId, toolCall.name, toolCall.input, {
+            conversationId: params.conversationId,
+            contactId: params.contactId,
+          }),
         );
         this.logger.debug(
           `[ai] tool "${toolCall.name}" executou em ${formatDuration(durationMs)}`,
@@ -372,24 +384,62 @@ export class AiService {
     return `${stripped}\n\n(obs.: não consegui confirmar o valor agora, pode me perguntar o preço de novo que eu confiro?)`;
   }
 
-  private buildSystemPrompt(customInstructions?: string): string {
+  private async buildCategoriesContext(tenantId: string): Promise<string> {
+    const cached = this.categoriesCache.get(tenantId);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) return cached.text;
+
+    const cats = await this.prisma.category.findMany({
+      where: { tenantId, active: true },
+      select: { name: true, description: true },
+      orderBy: { order: 'asc' },
+    });
+
+    const text =
+      cats.length === 0
+        ? '(esta loja ainda não cadastrou categorias — use as tools para verificar produtos)'
+        : cats
+            .map((c) =>
+              c.description ? `- ${c.name}: ${c.description}` : `- ${c.name}`,
+            )
+            .join('\n');
+
+    this.categoriesCache.set(tenantId, { text, expiresAt: now + this.categoriesCacheTtlMs });
+    return text;
+  }
+
+  private buildSystemPrompt(categoriesText: string, customInstructions?: string): string {
     return [
       'Você é atendente virtual de uma loja no WhatsApp. Curto, cordial, em português brasileiro.',
       '',
-      'REGRAS RÍGIDAS:',
-      '1. Use SOMENTE dados das ferramentas. NUNCA invente preço, cor, estoque, garantia.',
-      '2. Para citar preço, COPIE LITERAL priceDisplay/fullPriceText do resultado. Não recalcule.',
-      '3. matchQuality="none": NÃO existe o produto. NÃO ofereça outro tipo de produto. Diga honestamente que a loja não tem o item pedido e pergunte se aceita transferência para atendente humano.',
-      '4. matchQuality="partial": existe produto PARECIDO mas com diferença (ver "notMatched"). Avise honestamente sobre a diferença ANTES de oferecer. Ex: "Não temos Samsung mas temos da Apple, te interessa?"',
+      'O QUE A LOJA VENDE (categorias ativas):',
+      categoriesText,
+      '',
+      'REGRAS ABSOLUTAS — VIOLAR QUALQUER UMA É ERRO GRAVE:',
+      '',
+      '1. PROIBIDO INVENTAR PRODUTOS. Só pode mencionar produtos que vieram do resultado de search_products. Se não veio na resposta da tool, NÃO EXISTE na loja.',
+      '',
+      '2. PROIBIDO MENCIONAR CATEGORIAS QUE NÃO ESTÃO NA LISTA ACIMA. Se a lista diz que vende celulares, NÃO ofereça "casacos", "ingressos para show", "experiências" ou qualquer coisa que não esteja listada.',
+      '',
+      '3. matchQuality="none": A LOJA NÃO TEM o que o cliente pediu. Diga isso honestamente, copie o que a loja vende da lista acima, e ofereça transferir para humano. NÃO ofereça produtos diferentes só pra preencher resposta.',
+      '',
+      '4. matchQuality="partial": existe produto PARECIDO mas com diferença. Avise a diferença antes de oferecer. Ex: "Não tenho Samsung mas tenho iPhone, te interessa?"',
+      '',
       '5. matchQuality="exact": pode oferecer normalmente.',
-      '6. Cores em customFields vêm como "laranja (#ff8000)" — diga só "laranja", nunca o hex.',
+      '',
+      '6. PREÇO: Copie LITERAL o priceDisplay/fullPriceText. Nunca recalcule, nunca arredonde.',
+      '',
+      '7. Cores em customFields vêm como "laranja (#ff8000)" — diga só "laranja", nunca o hex.',
+      '',
+      '8. Se o cliente pede algo abstrato ("presente para alguém que ama música") e a loja só tem celulares, você pode SUGERIR um celular como presente musical — mas seja honesto: "olha, na nossa loja o que mais combina com música é um celular bom para ouvir, ou um fone se tiver. Aqui temos: ...". NUNCA invente que vende fones se a lista de categorias acima não inclui fones.',
       '',
       'FERRAMENTAS:',
-      '- search_products: cliente perguntou de produto/marca/cor/tamanho.',
-      '- list_categories: cliente perguntou o que a loja vende em geral.',
-      '- request_human_handoff: cliente irritado, pede atendente, problema sério, pede desconto, assistência técnica.',
+      '- search_products: cliente perguntou de produto/marca/cor/tamanho/uso/contexto.',
+      '- check_product_availability: depois de search_products, com UUID retornado.',
+      '- list_categories: cliente perguntou genericamente "o que vocês vendem?".',
+      '- request_human_handoff: cliente irritado, problema de pedido, desconto, assistência técnica.',
       '',
-      'NUNCA finja que um produto é o que o cliente pediu se não for. Se "matchQuality" disser que não bate, ACREDITE.',
+      'Se "matchQuality": "none" e tem "hint", USE o hint literal — ele já está formatado pra te ajudar.',
       ...(customInstructions
         ? ['', 'INSTRUÇÕES DA LOJA:', customInstructions]
         : []),
