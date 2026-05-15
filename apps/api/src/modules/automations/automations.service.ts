@@ -68,15 +68,21 @@ export class AutomationsService {
     const intentResult = await this.messageIntent.classify(ctx.messageText);
     this.logger.log(
       `[automations] intent="${intentResult.intent}" conf=${intentResult.confidence} ` +
-        `tookMs=${intentResult.durationMs} msg="${ctx.messageText.slice(0, 50)}"`,
+        `tookMs=${intentResult.durationMs} ` +
+        (intentResult.attribute ? `attr="${intentResult.attribute.canonical}" ` : '') +
+        `msg="${ctx.messageText.slice(0, 50)}"`,
     );
 
     const shortCircuit = this.handleShortCircuitIntent(ctx, intentResult.intent);
     if (shortCircuit !== null) return shortCircuit;
 
-    const faqAnswer = await this.tryFaqMatch(ctx.tenantId, ctx.messageText);
-    if (faqAnswer) {
-      return this.requestOutboundMessage(ctx, faqAnswer, true);
+    // FAQ só faz sentido pra perguntas gerais. Atributo específico SEMPRE vai
+    // pro AI agent porque depende de produto, não de Q&A estática.
+    if (intentResult.intent !== 'attribute_question') {
+      const faqAnswer = await this.tryFaqMatch(ctx.tenantId, ctx.messageText);
+      if (faqAnswer) {
+        return this.requestOutboundMessage(ctx, faqAnswer, true);
+      }
     }
 
     if (!settings?.aiEnabled) {
@@ -88,9 +94,11 @@ export class AutomationsService {
       const aiReply = await this.ai.generateReply({
         tenantId: ctx.tenantId,
         conversationId: ctx.conversationId,
+        contactId: ctx.contactId,
         userMessage: ctx.messageText,
         instructions: settings.aiInstructions ?? undefined,
         intent: intentResult.intent,
+        attribute: intentResult.attribute,
       });
 
       if (aiReply.handoff) {

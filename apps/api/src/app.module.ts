@@ -20,6 +20,7 @@ import { AutomationsModule } from './modules/automations/automations.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { DebugModule } from './modules/debug/debug.module';
 import { DevModule } from './modules/dev/dev.module';
+import { HealthModule } from './modules/health/health.module';
 
 const isDevelopment = process.env.NODE_ENV !== 'production';
 
@@ -42,6 +43,7 @@ const isDevelopment = process.env.NODE_ENV !== 'production';
 
     PrismaModule,
 
+    HealthModule,
     AuthModule,
     TenantsModule,
     UsersModule,

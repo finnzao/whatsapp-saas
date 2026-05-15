@@ -17,6 +17,7 @@ import { ProviderUnavailableError } from './providers/ollama.provider';
 import { withTimeout, timed, formatDuration, LlmTimeoutError } from './llm-timeout.util';
 import { fingerprint } from '../../common/utils/text-normalize';
 import type { MessageIntent } from './message-intent-classifier.service';
+import type { AttributeMatch } from './intent/attribute-extractor';
 
 interface GenerateReplyParams {
   tenantId: string;
@@ -25,6 +26,7 @@ interface GenerateReplyParams {
   userMessage: string;
   instructions?: string;
   intent?: MessageIntent;
+  attribute?: AttributeMatch;
 }
 
 interface AiReplyResult {
@@ -38,6 +40,7 @@ const PRODUCT_ORIENTED_INTENTS: ReadonlySet<MessageIntent> = new Set<MessageInte
   'product_question',
   'category_browse',
   'price_inquiry',
+  'attribute_question',
 ]);
 
 const TIMEOUT_FALLBACK_MESSAGE =
@@ -110,7 +113,7 @@ export class AiService {
 
     const history = await this.buildMessageHistory(params.conversationId);
     const categoriesText = await this.buildCategoriesContext(params.tenantId);
-    const systemPrompt = this.buildSystemPrompt(categoriesText, params.instructions);
+    const systemPrompt = this.buildSystemPrompt(categoriesText, params.attribute, params.instructions);
 
     const messages: LlmMessage[] = [
       ...history,
@@ -200,10 +203,13 @@ export class AiService {
       let handoffFromTool: { reason: string } | null = null;
 
       for (const toolCall of response.toolCalls) {
+        // Passa inferredAttribute como fallback: se modelo esqueceu attributeQuery
+        // mas o classifier detectou um atributo, a tool ainda promove a resposta.
         const { value: result, durationMs } = await timed(() =>
           this.tools.execute(params.tenantId, toolCall.name, toolCall.input, {
             conversationId: params.conversationId,
             contactId: params.contactId,
+            inferredAttribute: params.attribute?.canonical,
           }),
         );
         this.logger.debug(
@@ -408,8 +414,15 @@ export class AiService {
     return text;
   }
 
-  private buildSystemPrompt(categoriesText: string, customInstructions?: string): string {
-    return [
+  // Slot filling: o prompt agora ensina o modelo a passar attributeQuery quando
+  // a pergunta é sobre atributo, e a responder PRIMEIRO com attributeAnswer
+  // quando ela vier preenchida no tool result.
+  private buildSystemPrompt(
+    categoriesText: string,
+    attribute: AttributeMatch | undefined,
+    customInstructions?: string,
+  ): string {
+    const lines = [
       'Você é atendente virtual de uma loja no WhatsApp. Curto, cordial, em português brasileiro.',
       '',
       'O QUE A LOJA VENDE (categorias ativas):',
@@ -417,13 +430,13 @@ export class AiService {
       '',
       'REGRAS ABSOLUTAS — VIOLAR QUALQUER UMA É ERRO GRAVE:',
       '',
-      '1. PROIBIDO INVENTAR PRODUTOS. Só pode mencionar produtos que vieram do resultado de search_products. Se não veio na resposta da tool, NÃO EXISTE na loja.',
+      '1. PROIBIDO INVENTAR PRODUTOS. Só pode mencionar produtos que vieram do resultado de search_products.',
       '',
-      '2. PROIBIDO MENCIONAR CATEGORIAS QUE NÃO ESTÃO NA LISTA ACIMA. Se a lista diz que vende celulares, NÃO ofereça "casacos", "ingressos para show", "experiências" ou qualquer coisa que não esteja listada.',
+      '2. PROIBIDO MENCIONAR CATEGORIAS QUE NÃO ESTÃO NA LISTA ACIMA.',
       '',
-      '3. matchQuality="none": A LOJA NÃO TEM o que o cliente pediu. Diga isso honestamente, copie o que a loja vende da lista acima, e ofereça transferir para humano. NÃO ofereça produtos diferentes só pra preencher resposta.',
+      '3. matchQuality="none": A LOJA NÃO TEM o que o cliente pediu. Diga isso honestamente e ofereça transferir para humano.',
       '',
-      '4. matchQuality="partial": existe produto PARECIDO mas com diferença. Avise a diferença antes de oferecer. Ex: "Não tenho Samsung mas tenho iPhone, te interessa?"',
+      '4. matchQuality="partial": existe produto PARECIDO mas com diferença. Avise antes de oferecer.',
       '',
       '5. matchQuality="exact": pode oferecer normalmente.',
       '',
@@ -431,19 +444,35 @@ export class AiService {
       '',
       '7. Cores em customFields vêm como "laranja (#ff8000)" — diga só "laranja", nunca o hex.',
       '',
-      '8. Se o cliente pede algo abstrato ("presente para alguém que ama música") e a loja só tem celulares, você pode SUGERIR um celular como presente musical — mas seja honesto: "olha, na nossa loja o que mais combina com música é um celular bom para ouvir, ou um fone se tiver. Aqui temos: ...". NUNCA invente que vende fones se a lista de categorias acima não inclui fones.',
+      '8. PERGUNTAS DE ATRIBUTO ESPECÍFICO (cor, armazenamento, voltagem, tamanho, material, peso, garantia):',
+      '   a) Ao chamar check_product_availability, SEMPRE passe o parâmetro attributeQuery quando a pergunta for sobre um atributo. Use o nome canônico: "armazenamento" para GB/memória, "cor" para cor, "voltagem" para volt/bivolt, "tamanho" para tamanho.',
+      '   b) Quando o tool result tiver attributeAnswer preenchido, RESPONDA PRIMEIRO E APENAS com o valor de attributeAnswer.value. NÃO repita preço/estoque/desconto a menos que o cliente peça depois. Resposta curta, direta. Ex: cliente "quantos gbs?" → você "É 128GB!".',
+      '   c) Se attributeAnswer for null e veio uma instruction dizendo que o atributo não existe, NÃO INVENTE valor. Diga honestamente que não tem esse dado e ofereça atendente.',
+      '   d) Se já há um produto na conversa recente e o cliente pergunta um atributo, NÃO repita search_products — vá direto em check_product_availability com o productId daquele produto + attributeQuery.',
+      '',
+      '9. Se o cliente pede algo abstrato e a loja só tem categorias específicas, seja honesto sobre o que a loja vende. NUNCA invente categorias.',
       '',
       'FERRAMENTAS:',
-      '- search_products: cliente perguntou de produto/marca/cor/tamanho/uso/contexto.',
-      '- check_product_availability: depois de search_products, com UUID retornado.',
+      '- search_products: cliente perguntou de produto/marca/cor/tamanho/uso/contexto pela primeira vez.',
+      '- check_product_availability: detalhes de produto já mostrado, OU pergunta de atributo específico (passe attributeQuery).',
       '- list_categories: cliente perguntou genericamente "o que vocês vendem?".',
       '- request_human_handoff: cliente irritado, problema de pedido, desconto, assistência técnica.',
-      '',
-      'Se "matchQuality": "none" e tem "hint", USE o hint literal — ele já está formatado pra te ajudar.',
-      ...(customInstructions
-        ? ['', 'INSTRUÇÕES DA LOJA:', customInstructions]
-        : []),
-    ].join('\n');
+    ];
+
+    if (attribute) {
+      lines.push(
+        '',
+        'CONTEXTO DESTA MENSAGEM (detectado pelo sistema):',
+        `O cliente está perguntando sobre o ATRIBUTO: "${attribute.canonical}" (trecho que disparou: "${attribute.raw}").`,
+        `Ao chamar check_product_availability, passe attributeQuery="${attribute.canonical}".`,
+      );
+    }
+
+    if (customInstructions) {
+      lines.push('', 'INSTRUÇÕES DA LOJA:', customInstructions);
+    }
+
+    return lines.join('\n');
   }
 
   private async buildMessageHistory(conversationId: string): Promise<LlmMessage[]> {

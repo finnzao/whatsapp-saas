@@ -3,10 +3,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { LlmProviderFactory } from './providers/llm-provider.factory';
 import { LlmProvider } from './providers/llm-provider.interface';
 import { fingerprint, normalize } from '../../common/utils/text-normalize';
+import { detectAttributeIntent, AttributeMatch } from './intent/attribute-extractor';
 
 export type MessageIntent =
   | 'product_search'
   | 'product_question'
+  | 'attribute_question'
   | 'category_browse'
   | 'price_inquiry'
   | 'order_status'
@@ -21,11 +23,15 @@ export interface MessageIntentResult {
   confidence: 'high' | 'medium' | 'low';
   reason?: string;
   durationMs: number;
+  // Quando intent === 'attribute_question', traz qual atributo foi perguntado.
+  attribute?: AttributeMatch;
 }
 
 const INTENT_DESCRIPTIONS: Record<MessageIntent, string> = {
   product_search: 'cliente quer encontrar/comprar um produto, mencionando tipo, marca, característica',
-  product_question: 'cliente pergunta detalhes sobre produto específico (cor, tamanho, garantia, originalidade)',
+  product_question: 'cliente pergunta detalhes gerais sobre um produto (original, garantia, vem com caixa, estado)',
+  attribute_question:
+    'cliente pergunta um ATRIBUTO ESPECÍFICO de produto já mencionado: "quantos GB?", "qual a cor?", "é bivolt?", "qual o tamanho?"',
   category_browse: 'cliente pergunta genericamente o que a loja vende ou quer ver categorias',
   price_inquiry: 'cliente pergunta valor/preço de produto específico',
   order_status: 'cliente quer saber status de pedido/entrega já feito',
@@ -99,7 +105,9 @@ export class MessageIntentClassifier {
     const cached = this.cache.get(cacheKey);
     if (cached) {
       this.logger.debug(`[msg-intent] cache hit "${trimmed.slice(0, 40)}" → ${cached}`);
-      return { intent: cached, confidence: 'high', reason: 'cache hit', durationMs: Date.now() - start };
+      // Mesmo no cache hit, reavalia atributo (é barato e mantém o sinal).
+      const attribute = cached === 'attribute_question' ? detectAttributeIntent(trimmed) ?? undefined : undefined;
+      return { intent: cached, confidence: 'high', reason: 'cache hit', durationMs: Date.now() - start, attribute };
     }
 
     const available = await this.provider.isAvailable();
@@ -111,8 +119,9 @@ export class MessageIntentClassifier {
     try {
       const intent = await this.classifyWithLlm(trimmed);
       this.cache.set(cacheKey, intent);
+      const attribute = intent === 'attribute_question' ? detectAttributeIntent(trimmed) ?? undefined : undefined;
       this.logger.debug(`[msg-intent] "${trimmed.slice(0, 40)}" → ${intent} (${Date.now() - start}ms)`);
-      return { intent, confidence: 'high', durationMs: Date.now() - start };
+      return { intent, confidence: 'high', durationMs: Date.now() - start, attribute };
     } catch (err) {
       this.logger.error(`[msg-intent] erro: ${(err as Error).message}`);
       return { intent: 'unclear', confidence: 'low', reason: 'classifier error', durationMs: Date.now() - start };
@@ -132,6 +141,18 @@ export class MessageIntentClassifier {
       return { intent: 'handoff_request', confidence: 'high', reason: 'pattern match' };
     }
 
+    // Fast path para pergunta de atributo — bate "quantos gbs", "qual a cor", etc.
+    // Evita ida ao LLM e já entrega o atributo extraído.
+    const attribute = detectAttributeIntent(text);
+    if (attribute) {
+      return {
+        intent: 'attribute_question',
+        confidence: 'high',
+        reason: `attribute pattern: ${attribute.canonical}`,
+        attribute,
+      };
+    }
+
     return null;
   }
 
@@ -149,10 +170,11 @@ Regras:
 - Escolha SOMENTE uma categoria.
 - Responda APENAS com JSON válido, sem markdown, sem prefixo: {"intent": "<categoria>"}
 - Em caso de dúvida real, use "unclear".
-- "tem iphone?" é product_search, não product_question.
+- "tem iphone?" é product_search.
 - "esse iphone é original?" é product_question.
+- "quantos gbs?", "qual a cor?", "qual o tamanho?", "é bivolt?" é attribute_question.
 - "quanto custa?" sozinho ou "qual o preço?" é price_inquiry.
-- Reclamação de defeito/atraso/erro = complaint, mesmo educada.`;
+- Reclamação de defeito/atraso/erro é complaint.`;
 
     const response = await this.provider.complete({
       system: systemPrompt,

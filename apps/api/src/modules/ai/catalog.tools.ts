@@ -3,6 +3,7 @@ import { Prisma, Product, ProductVariation } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { normalize, tokenize } from '../../common/utils/text-normalize';
 import { EmbeddingService } from './embeddings/embedding.service';
+import { findCustomFieldByAttribute, listKnownAttributes } from './intent/attribute-extractor';
 
 type ProductWithRelations = Product & {
   category: { name: string } | null;
@@ -171,9 +172,12 @@ interface CategoryKeywordContext {
   hasAnyKeywords: boolean;
 }
 
-interface SearchContext {
+// Contexto que o AiService passa ao executar uma tool. inferredAttribute é
+// usado como fallback quando o modelo esquece de passar attributeQuery.
+export interface SearchContext {
   conversationId?: string;
   contactId?: string;
+  inferredAttribute?: string;
 }
 
 interface RankedProduct {
@@ -199,21 +203,21 @@ export class CatalogTools {
   constructor(
     private readonly prisma: PrismaService,
     private readonly embeddings: EmbeddingService,
-  ) { }
+  ) {}
 
   getToolDefinitions() {
     return [
       {
         name: 'search_products',
         description:
-          'USE SEMPRE QUE O CLIENTE PERGUNTAR SOBRE PRODUTOS. Busca no catálogo combinando palavras-chave e busca semântica (intenção). Retorna matchQuality ("exact"/"partial"/"none") e priceDisplay já FORMATADO em reais — sempre use o priceDisplay literal ao responder, NUNCA recalcule.',
+          'USE SEMPRE QUE O CLIENTE PERGUNTAR SOBRE PRODUTOS. Busca no catálogo combinando palavras-chave e busca semântica. Retorna matchQuality e priceDisplay já formatado — use priceDisplay literal, NUNCA recalcule.',
         parameters: {
           type: 'object' as const,
           properties: {
             query: {
               type: 'string',
               description:
-                'Texto livre com as palavras do cliente, incluindo características (cor, tamanho, marca) ou intenção (presente, uso, contexto).',
+                'Texto livre com palavras do cliente, incluindo características (cor, tamanho, marca) ou intenção (presente, uso, contexto).',
             },
             maxPrice: { type: 'number', description: 'Preço máximo em reais (opcional)' },
             minPrice: { type: 'number', description: 'Preço mínimo em reais (opcional)' },
@@ -225,13 +229,20 @@ export class CatalogTools {
       {
         name: 'check_product_availability',
         description:
-          'NÃO use para perguntas iniciais. Use APENAS depois de search_products, com um UUID retornado por ele. NUNCA invente productId.',
+          'Use APENAS depois de search_products, com UUID retornado por ele. Se o cliente perguntou um ATRIBUTO ESPECÍFICO (cor, armazenamento, voltagem, tamanho), passe attributeQuery — a tool retorna o valor exato no topo da resposta (attributeAnswer). Atributos conhecidos: ' +
+          listKnownAttributes().join(', ') +
+          '.',
         parameters: {
           type: 'object' as const,
           properties: {
             productId: {
               type: 'string',
               description: 'UUID retornado antes por search_products.',
+            },
+            attributeQuery: {
+              type: 'string',
+              description:
+                'Atributo específico que o cliente perguntou (ex: "armazenamento", "cor", "voltagem"). Opcional. Use quando a pergunta é sobre uma característica única.',
             },
           },
           required: ['productId'],
@@ -820,7 +831,15 @@ export class CatalogTools {
     return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
   }
 
-  async checkProductAvailability(tenantId: string, productId: string, ctx: SearchContext = {}) {
+  // Quando há attributeQuery, este método faz "reranking" do payload:
+  // promove o atributo perguntado pro topo (attributeAnswer) e desloca o resto
+  // pra `_extra`. O modelo deve responder primeiro com attributeAnswer.
+  async checkProductAvailability(
+    tenantId: string,
+    productId: string,
+    ctx: SearchContext = {},
+    attributeQuery?: string,
+  ) {
     if (!this.isUuid(productId)) {
       this.logger.warn(
         `[check_product_availability] productId inválido: "${productId}". Modelo deveria usar search_products primeiro.`,
@@ -847,20 +866,56 @@ export class CatalogTools {
     }
 
     const cf = product.customFields as Record<string, unknown> | null;
+    const enrichedCf = cf ? this.enrichCustomFieldsForDisplay(cf) : null;
     const priceInfo = this.buildPriceInfo(product as ProductWithRelations);
-    return {
+
+    // Resolve atributo: prioriza o que o modelo passou, fallback no que o
+    // intent classifier detectou. Se ainda não achou, retorna payload normal.
+    const effectiveAttributeQuery = attributeQuery?.trim() || ctx.inferredAttribute;
+    let attributeAnswer: { field: string; value: unknown; query: string } | null = null;
+    if (effectiveAttributeQuery && enrichedCf) {
+      const matched = findCustomFieldByAttribute(effectiveAttributeQuery, enrichedCf);
+      if (matched) {
+        attributeAnswer = { ...matched, query: effectiveAttributeQuery };
+      }
+    }
+
+    const basePayload = {
       found: true,
+      productId: product.id,
       name: product.name,
-      priceDisplay: priceInfo.priceDisplay,
-      priceCashDisplay: priceInfo.priceCashDisplay,
-      installmentsDisplay: priceInfo.installmentsDisplay,
-      fullPriceText: priceInfo.fullPriceText,
       available: product.active && !product.paused && (!product.trackStock || product.stock > 0),
       stockText: product.trackStock
         ? product.stock > 0 ? `${product.stock} em estoque` : 'sem estoque'
         : 'disponível',
-      customFields: cf ? this.enrichCustomFieldsForDisplay(cf) : null,
+      priceDisplay: priceInfo.priceDisplay,
+      priceCashDisplay: priceInfo.priceCashDisplay,
+      installmentsDisplay: priceInfo.installmentsDisplay,
+      fullPriceText: priceInfo.fullPriceText,
+      customFields: enrichedCf,
+      category: product.category?.name ?? null,
     };
+
+    if (attributeAnswer) {
+      return {
+        attributeAnswer,
+        instruction: `O cliente perguntou sobre "${attributeAnswer.query}". RESPONDA PRIMEIRO E APENAS com: ${attributeAnswer.field} = ${attributeAnswer.value}. NÃO repita preço/estoque/desconto a menos que o cliente peça depois. Mantenha curto.`,
+        productName: product.name,
+        _extra: basePayload,
+      };
+    }
+
+    if (effectiveAttributeQuery && !attributeAnswer) {
+      return {
+        attributeAnswer: null,
+        instruction: `O cliente perguntou sobre "${effectiveAttributeQuery}" mas este produto não tem esse atributo cadastrado em customFields. Diga honestamente que não sabe esse dado específico e ofereça transferir para atendente. NÃO INVENTE valor.`,
+        productName: product.name,
+        availableAttributes: enrichedCf ? Object.keys(enrichedCf) : [],
+        _extra: basePayload,
+      };
+    }
+
+    return basePayload;
   }
 
   async listCategories(tenantId: string) {
@@ -881,7 +936,7 @@ export class CatalogTools {
       case 'search_products':
         return this.searchProducts(tenantId, input, ctx);
       case 'check_product_availability':
-        return this.checkProductAvailability(tenantId, input.productId, ctx);
+        return this.checkProductAvailability(tenantId, input.productId, ctx, input.attributeQuery);
       case 'list_categories':
         return this.listCategories(tenantId);
       case 'request_human_handoff':

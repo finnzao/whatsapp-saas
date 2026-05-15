@@ -8,9 +8,14 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev": "concurrently -n api,web -c blue,green \"npm run dev:api\" \"npm run dev:web\"",
     "dev:api": "npm run dev --workspace=@app/api",
     "dev:web": "npm run dev --workspace=@app/web",
+    "dev:with-evals": "concurrently -n api,web,eval -c blue,green,magenta \"npm run dev:api\" \"npm run dev:web\" \"npm run eval:after-ready\"",
+    "eval": "npm run eval --workspace=@app/api",
+    "eval:bug": "EVAL_FILTER=attribute npm run eval --workspace=@app/api",
+    "eval:after-ready": "wait-on -t 120000 http://localhost:3001/health && npm run eval",
+    "eval:once": "concurrently -n api,eval -c blue,magenta --kill-others --success command-eval \"npm run dev:api\" \"npm run eval:after-ready\"",
     "build": "npm run build --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
@@ -26,7 +31,8 @@
   "devDependencies": {
     "concurrently": "^8.2.2",
     "prettier": "^3.2.5",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "wait-on": "^9.0.10"
   },
   "engines": {
     "node": ">=20.0.0"

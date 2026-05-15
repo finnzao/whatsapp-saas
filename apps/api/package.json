@@ -5,6 +5,8 @@
   "description": "Backend API - WhatsApp SaaS",
   "scripts": {
     "build": "nest build",
+    "eval": "ts-node test/agent-evals/run-evals.ts",
+    "eval:bug": "EVAL_FILTER=attribute ts-node test/agent-evals/run-evals.ts",
     "start": "nest start",
     "dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",

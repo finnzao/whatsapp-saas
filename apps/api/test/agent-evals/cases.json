@@ -1,0 +1,134 @@
+{
+  "$schema": "Não validado em runtime — formato livre. Campos esperados pelo runner:",
+  "$fields": {
+    "name": "identificador único do caso",
+    "skip": "opcional, true para pular",
+    "description": "descrição humana, opcional",
+    "seed": "opcional, se true roda POST /dev/seed antes",
+    "messages": "sequência de mensagens. Cada item tem { send, expect }. send é o texto que o cliente manda. expect é validado contra a resposta do bot.",
+    "expect.contains": "lista de strings que DEVEM aparecer na resposta (case-insensitive)",
+    "expect.containsAny": "lista — pelo menos UMA das strings deve aparecer",
+    "expect.notContains": "lista de strings que NÃO podem aparecer",
+    "expect.handoff": "se true, a conversa deve virar handoff em vez de bot_reply",
+    "expect.maxLength": "limite máximo de caracteres na resposta"
+  },
+  "cases": [
+    {
+      "name": "attribute-armazenamento-iphone",
+      "description": "Caso bug reportado: cliente pergunta GBs e bot responde preço",
+      "seed": true,
+      "messages": [
+        {
+          "send": "tem iphone azul?",
+          "expect": {
+            "containsAny": ["iphone", "azul"],
+            "notContains": ["não temos", "não tem"]
+          }
+        },
+        {
+          "send": "quantos gbs é o iphone?",
+          "expect": {
+            "containsAny": ["128GB", "128 GB", "128gb"],
+            "notContains": ["R$"],
+            "maxLength": 200
+          }
+        }
+      ]
+    },
+    {
+      "name": "attribute-cor-iphone",
+      "seed": true,
+      "messages": [
+        {
+          "send": "tem iphone 15?",
+          "expect": { "contains": ["iPhone 15"] }
+        },
+        {
+          "send": "qual a cor desse iphone?",
+          "expect": {
+            "containsAny": ["preto", "preta"],
+            "notContains": ["R$"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "price-inquiry-padrao",
+      "description": "Pergunta direta de preço deve responder preço normalmente",
+      "seed": true,
+      "messages": [
+        {
+          "send": "quanto custa o iphone 13 azul?",
+          "expect": {
+            "contains": ["R$"],
+            "containsAny": ["4.299", "4299"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "search-tem-produto",
+      "seed": true,
+      "messages": [
+        {
+          "send": "tem iphone laranja?",
+          "expect": {
+            "containsAny": ["iphone", "iPhone"],
+            "containsAny2": ["laranja"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "loja-nao-tem-produto",
+      "seed": true,
+      "messages": [
+        {
+          "send": "vocês vendem geladeira?",
+          "expect": {
+            "containsAny": ["não temos", "não tem", "não vendemos", "não vende"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "handoff-explicito",
+      "messages": [
+        {
+          "send": "quero falar com um atendente humano",
+          "expect": { "handoff": true }
+        }
+      ]
+    },
+    {
+      "name": "greeting-curto",
+      "messages": [
+        {
+          "send": "oi",
+          "expect": {
+            "containsAny": ["olá", "oi", "ajudar"],
+            "maxLength": 120
+          }
+        }
+      ]
+    },
+    {
+      "name": "attribute-inexistente",
+      "description": "Cliente pergunta atributo que o produto não tem cadastrado — bot deve admitir, não inventar",
+      "seed": true,
+      "messages": [
+        {
+          "send": "tem iphone 15?",
+          "expect": { "contains": ["iPhone 15"] }
+        },
+        {
+          "send": "quanto pesa o iphone?",
+          "expect": {
+            "notContains": ["grama", "kg"],
+            "containsAny": ["não", "consulto", "atendente", "informação"]
+          }
+        }
+      ]
+    }
+  ]
+}
