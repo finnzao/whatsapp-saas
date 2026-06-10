@@ -2,15 +2,18 @@
 
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { useAuthStore } from '@/stores/auth.store';
+import { useAuthHydrated, useIsAuthenticated } from '@/lib/hooks/useAuth';
 
 export default function HomePage() {
   const router = useRouter();
-  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const hydrated = useAuthHydrated();
+  const isAuthenticated = useIsAuthenticated();
 
   useEffect(() => {
+    // Só decide depois de hidratar pra não redirecionar pro /login indevidamente.
+    if (!hydrated) return;
     router.replace(isAuthenticated ? '/conversas' : '/login');
-  }, [isAuthenticated, router]);
+  }, [hydrated, isAuthenticated, router]);
 
   return (
     <div className="flex h-screen items-center justify-center">

@@ -36,20 +36,17 @@ export class AnthropicProvider implements LlmProvider {
 
   async complete(request: LlmCompletionRequest): Promise<LlmCompletionResponse> {
     const anthropicMessages = this.toAnthropicMessages(request.messages);
+    const tools = this.buildTools(request);
 
     const response = await this.client.messages.create({
       model: this.model,
       max_tokens: request.maxTokens ?? 1024,
       temperature: request.temperature,
-      system: request.system,
+      system: this.buildSystem(request) as any,
       stop_sequences: request.stopSequences,
       messages: anthropicMessages,
-      ...(request.tools && {
-        tools: request.tools.map((t) => ({
-          name: t.name,
-          description: t.description,
-          input_schema: t.parameters,
-        })),
+      ...(tools && {
+        tools,
         ...(request.toolChoice && {
           tool_choice: this.mapToolChoice(request.toolChoice),
         }),
@@ -70,16 +67,51 @@ export class AnthropicProvider implements LlmProvider {
         input: b.input,
       }));
 
+    const usage = response.usage as any;
+
     return {
       text,
       toolCalls,
       stopReason: this.mapStopReason(response.stop_reason),
       rawContent: response.content,
       usage: {
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
+        inputTokens: usage.input_tokens,
+        outputTokens: usage.output_tokens,
+        cacheReadInputTokens: usage.cache_read_input_tokens ?? undefined,
+        cacheCreationInputTokens: usage.cache_creation_input_tokens ?? undefined,
       },
     };
+  }
+
+  // System como bloco com cache_control quando marcado cacheável; senão string.
+  private buildSystem(request: LlmCompletionRequest): unknown {
+    if (!request.system) return undefined;
+    if (request.cache?.system) {
+      return [
+        {
+          type: 'text',
+          text: request.system,
+          cache_control: { type: 'ephemeral' },
+        },
+      ];
+    }
+    return request.system;
+  }
+
+  // Anthropic cacheia o prefixo até o bloco marcado; marcar a última tool
+  // cobre todo o schema de ferramentas (que é estável entre chamadas).
+  private buildTools(request: LlmCompletionRequest): any[] | undefined {
+    if (!request.tools || request.tools.length === 0) return undefined;
+    const tools = request.tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.parameters,
+    })) as any[];
+    if (request.cache?.tools) {
+      const last = tools.length - 1;
+      tools[last] = { ...tools[last], cache_control: { type: 'ephemeral' } };
+    }
+    return tools;
   }
 
   private mapToolChoice(choice: LlmToolChoice): any {

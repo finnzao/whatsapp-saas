@@ -10,6 +10,7 @@ import { AnthropicProvider } from './providers/anthropic.provider';
 import { OllamaProvider } from './providers/ollama.provider';
 import { OpenAiCompatibleProvider } from './providers/openai-compatible.provider';
 import { EmbeddingsModule } from './embeddings/embeddings.module';
+import { SearchInteractionListener } from './search-interaction/search-interaction.listener';
 
 @Module({
   imports: [EmbeddingsModule],
@@ -23,6 +24,7 @@ import { EmbeddingsModule } from './embeddings/embeddings.module';
     AnthropicProvider,
     OllamaProvider,
     OpenAiCompatibleProvider,
+    SearchInteractionListener,
   ],
   exports: [AiService, IntentClassifier, MessageIntentClassifier, EmbeddingsModule],
 })

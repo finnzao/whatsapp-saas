@@ -5,88 +5,45 @@ import { toast } from 'sonner';
 import { api, extractApiError } from '@/lib/api/client';
 import { useAuthStore, AuthUser } from '@/lib/stores/auth.store';
 
-if (typeof window !== 'undefined') {
-  console.log('%c[useAuth] módulo carregado — BUILD ' + Date.now(), 'color: hotpink; font-weight: bold');
-}
-
 interface LoginResponse {
   token?: string;
   access_token?: string;
   accessToken?: string;
   user?: AuthUser;
-  data?: {
-    token?: string;
-    user?: AuthUser;
-  };
+  data?: { token?: string; user?: AuthUser };
 }
-
-const DEBUG = typeof window !== 'undefined' && process.env.NODE_ENV !== 'production';
 
 function hardRedirect(path: string) {
-  if (DEBUG) console.log('[useAuth] hardRedirect →', path);
-  if (typeof window !== 'undefined') {
-    window.location.assign(path);
-  }
+  if (typeof window !== 'undefined') window.location.assign(path);
 }
 
+// Normaliza as diferentes formas de payload que o backend pode retornar.
 function extractAuthFromResponse(raw: unknown): { token: string; user: AuthUser } | null {
-  console.log('[useAuth] resposta crua do backend:', raw);
-
-  if (!raw || typeof raw !== 'object') {
-    console.error('[useAuth] resposta não é objeto');
-    return null;
-  }
-
+  if (!raw || typeof raw !== 'object') return null;
   const r = raw as LoginResponse;
-
   const token = r.token ?? r.access_token ?? r.accessToken ?? r.data?.token;
   const user = r.user ?? r.data?.user;
-
-  if (!token) {
-    console.error('[useAuth] token NÃO encontrado na resposta. Chaves disponíveis:', Object.keys(r));
-    return null;
-  }
-  if (!user) {
-    console.error('[useAuth] user NÃO encontrado na resposta. Chaves disponíveis:', Object.keys(r));
-    return null;
-  }
-
-  console.log('[useAuth] extraído:', { hasToken: Boolean(token), user });
+  if (!token || !user) return null;
   return { token, user };
 }
 
 export function useLogin() {
   return useMutation({
     mutationFn: async (payload: { email: string; password: string }) => {
-      console.log('[useAuth] useLogin.mutationFn chamado', { email: payload.email });
-      try {
-        const { data, status } = await api.post('/auth/login', payload);
-        console.log('[useAuth] POST /auth/login respondeu', { status });
-        return data;
-      } catch (e) {
-        console.error('[useAuth] POST /auth/login FALHOU', e);
-        throw e;
-      }
+      const { data } = await api.post('/auth/login', payload);
+      return data;
     },
     onSuccess: (data) => {
-      console.log('[useAuth] onSuccess disparado');
       const extracted = extractAuthFromResponse(data);
       if (!extracted) {
-        toast.error('Resposta de login inválida — veja o console');
+        toast.error('Resposta de login inválida');
         return;
       }
       useAuthStore.getState().setAuth(extracted.token, extracted.user);
       toast.success(`Bem-vindo, ${extracted.user.name}`);
-
-      const stored = localStorage.getItem('auth-storage');
-      console.log('[useAuth] APÓS setAuth, localStorage tem:', stored);
-
-      setTimeout(() => hardRedirect('/conversas'), 50);
+      hardRedirect('/conversas');
     },
-    onError: (e) => {
-      console.error('[useAuth] onError', e);
-      toast.error(extractApiError(e));
-    },
+    onError: (e) => toast.error(extractApiError(e)),
   });
 }
 
@@ -104,12 +61,12 @@ export function useRegister() {
     onSuccess: (data) => {
       const extracted = extractAuthFromResponse(data);
       if (!extracted) {
-        toast.error('Resposta de registro inválida — veja o console');
+        toast.error('Resposta de registro inválida');
         return;
       }
       useAuthStore.getState().setAuth(extracted.token, extracted.user);
       toast.success('Conta criada com sucesso!');
-      setTimeout(() => hardRedirect('/conversas'), 50);
+      hardRedirect('/conversas');
     },
     onError: (e) => toast.error(extractApiError(e)),
   });

@@ -1,3 +1,5 @@
+import type { PromptCacheHint } from '../caching/prompt-cache';
+
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | LlmContentBlock[];
@@ -50,6 +52,9 @@ export interface LlmCompletionRequest {
   temperature?: number;
   stopSequences?: string[];
   responseFormat?: 'text' | 'json';
+  // Hint neutro de cache: aplicado nativamente por quem suporta (Anthropic),
+  // ignorado pelos demais providers.
+  cache?: PromptCacheHint;
 }
 
 export interface LlmCompletionResponse {
@@ -60,6 +65,9 @@ export interface LlmCompletionResponse {
   usage?: {
     inputTokens: number;
     outputTokens: number;
+    // Preenchidos quando o provider reporta prompt caching (Anthropic).
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
   };
 }
 

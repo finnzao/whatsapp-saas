@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "Backend API - WhatsApp SaaS",
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  },
   "scripts": {
     "build": "nest build",
     "eval": "ts-node test/agent-evals/run-evals.ts",
